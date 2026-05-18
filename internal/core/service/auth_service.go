@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
-
-	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 
 	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
 	"github.com/safaci2000/ghost-sso-proxy/internal/core/ports/secondary"
@@ -40,18 +37,20 @@ func New(
 	}
 }
 
-// EnsureSession implements driving.AuthService.
-func (s *AuthService) EnsureSession(ctx context.Context, headers []*corev3.HeaderValue) (string, error) {
-	cookieHeader := headerValue(headers, "cookie")
-
+// EnsureSession implements primary.AuthService.
+func (s *AuthService) EnsureSession(ctx context.Context, cookieHeader, authHeader string) (string, error) {
 	// Fast path: ghost session cookie already present, nothing to do.
 	if hasGhostSessionCookie(cookieHeader) {
 		s.logger.DebugContext(ctx, "ghost-admin-api-session cookie present, passing through")
 		return "", nil
 	}
 
-	// Decode OIDC identity from the IdToken-* cookie Envoy sets after auth.
-	identity, err := s.decoder.Decode(ctx, cookieHeader)
+	// Decode OIDC identity.
+	// Envoy Gateway encrypts IdToken-* cookies; the decrypted access token is
+	// forwarded as "Authorization: Bearer <jwt>" when forwardAccessToken=true in
+	// the SecurityPolicy. We pass both so the decoder can try Bearer first and
+	// fall back to the cookie path for local dev / testing.
+	identity, err := s.decoder.Decode(ctx, cookieHeader, authHeader)
 	if err != nil {
 		return "", fmt.Errorf("oidc token decode: %w", err)
 	}
@@ -80,6 +79,11 @@ func (s *AuthService) EnsureSession(ctx context.Context, headers []*corev3.Heade
 	if existing != nil {
 		s.logger.InfoContext(ctx, "reusing existing ghost session",
 			slog.String("user_id", user.ID))
+		// At debug level emit the full signed value so operators can manually
+		// paste it into browser DevTools (Application → Cookies) to verify
+		// that Ghost accepts it independently of Envoy's cookie forwarding.
+		s.logger.DebugContext(ctx, "signed cookie for manual browser test",
+			slog.String("cookie_value", existing.SignedCookieValue))
 		return existing.SignedCookieValue, nil
 	}
 
@@ -92,23 +96,10 @@ func (s *AuthService) EnsureSession(ctx context.Context, headers []*corev3.Heade
 	s.logger.InfoContext(ctx, "created ghost admin session",
 		slog.String("user_id", user.ID),
 		slog.String("email", identity.Email))
+	s.logger.DebugContext(ctx, "signed cookie for manual browser test",
+		slog.String("cookie_value", session.SignedCookieValue))
 
 	return session.SignedCookieValue, nil
-}
-
-// headerValue returns the value of the first header matching name (case-insensitive).
-func headerValue(headers []*corev3.HeaderValue, name string) string {
-	for _, h := range headers {
-		if strings.EqualFold(h.GetKey(), name) {
-			// Prefer RawValue (bytes) for headers that may contain non-UTF-8 data;
-			// fall back to the string Value field.
-			if raw := h.GetRawValue(); len(raw) > 0 {
-				return string(raw)
-			}
-			return h.GetValue()
-		}
-	}
-	return ""
 }
 
 // hasGhostSessionCookie reports whether the Cookie header contains a ghost-admin-api-session entry.

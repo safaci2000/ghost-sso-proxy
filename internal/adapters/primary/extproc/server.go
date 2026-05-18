@@ -8,13 +8,14 @@
 //     — Call AuthService.EnsureSession with the request headers.
 //     — If a ghost-admin-api-session cookie already exists → CONTINUE, tell
 //       Envoy to skip the response-header phase (ModeOverride SKIP).
-//     — If a new signed cookie value is returned → store it in stream-local
-//       state, CONTINUE (response-header phase will fire).
+//     — If a new signed cookie value is returned → send an ImmediateResponse
+//       302 redirect to /ghost/ with Set-Cookie. The browser stores the
+//       cookie and retries; the retry hits the fast path above.
 //     — On any error → log and pass through; Ghost renders its own login page.
 //
-//  2. ProcessingRequest_ResponseHeaders arrives (only when step 1 flagged it).
-//     — Mutate the response by adding Set-Cookie with the signed cookie value.
-//     — The browser stores the cookie; the Ghost SPA boots already authenticated.
+//  Note: Envoy Gateway strips Set-Cookie from ExtProc response-header mutations
+//  and does not apply ExtProc upstream request Cookie mutations to the forwarded
+//  request. The ImmediateResponse redirect is the only reliable delivery path.
 package extproc
 
 import (
@@ -22,10 +23,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	filterv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_proc/v3"
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 
 	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
 	"github.com/safaci2000/ghost-sso-proxy/internal/core/ports/primary"
@@ -33,29 +36,39 @@ import (
 
 const (
 	ghostSessionCookieName = "ghost-admin-api-session"
-	// cookieMaxAge is the Max-Age we set on the injected cookie (24 h).
-	// Ghost itself treats sessions as browser-session cookies, but setting
-	// Max-Age makes the cookie survive browser restarts for convenience.
-	cookieMaxAge = 86400
+
+	// ghostAdminPath is the canonical redirect target after planting the session
+	// cookie. We always redirect here rather than echoing back the original
+	// :path — see the slow-path comment in Process() for the full rationale.
+	ghostAdminPath = "/ghost/"
+
+	// cookieMaxAge is the default Max-Age for the injected session cookie in
+	// seconds (180 days). This is only used in unit tests; production code reads
+	// the value from cfg.SessionMaxAgeDays via Server.sessionMaxAgeSecs.
+	cookieMaxAge = 180 * 24 * 60 * 60 // 15552000 seconds
 )
 
 // Server implements extprocv3.ExternalProcessorServer.
 type Server struct {
 	extprocv3.UnimplementedExternalProcessorServer
-	auth   primary.AuthService
-	logger *slog.Logger
+	auth              primary.AuthService
+	logger            *slog.Logger
+	sessionMaxAgeSecs int // Max-Age for the Set-Cookie header, in seconds
 }
 
 // NewServer constructs a Server driven by the provided AuthService.
-func NewServer(auth primary.AuthService, logger *slog.Logger) *Server {
-	return &Server{auth: auth, logger: logger}
+// sessionMaxAgeDays should come from cfg.SessionMaxAgeDays so the cookie
+// lifetime tracks the SESSION_MAX_AGE_DAYS environment variable.
+func NewServer(auth primary.AuthService, logger *slog.Logger, sessionMaxAgeDays int) *Server {
+	return &Server{
+		auth:              auth,
+		logger:            logger,
+		sessionMaxAgeSecs: sessionMaxAgeDays * 24 * 60 * 60,
+	}
 }
 
 // Process handles one bidirectional ExtProc gRPC stream (= one HTTP request).
 func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error {
-	// pendingCookie is non-empty when we need to inject Set-Cookie in the response phase.
-	var pendingCookie string
-
 	for {
 		req, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -68,9 +81,13 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 		switch v := req.Request.(type) {
 
 		case *extprocv3.ProcessingRequest_RequestHeaders:
+			headers := v.RequestHeaders.GetHeaders().GetHeaders()
+			cookieHeader := rawHeaderValue(headers, "cookie")
+			authHeader := rawHeaderValue(headers, "authorization")
 			signedCookie, err := s.auth.EnsureSession(
 				stream.Context(),
-				v.RequestHeaders.GetHeaders().GetHeaders(),
+				cookieHeader,
+				authHeader,
 			)
 			if err != nil {
 				// On any auth error, log and pass through. Ghost's own login
@@ -82,7 +99,7 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 				}
 				s.logger.Log(stream.Context(), level, "auth service error, passing through",
 					slog.Any("error", err))
-				if err := stream.Send(requestHeadersContinue(true)); err != nil {
+				if err := stream.Send(requestHeadersContinue(true, nil, []string{"authorization"})); err != nil {
 					return fmt.Errorf("extproc: send (pass-through): %w", err)
 				}
 				continue
@@ -90,37 +107,46 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 
 			if signedCookie == "" {
 				// Session cookie already present — skip response-header processing.
-				if err := stream.Send(requestHeadersContinue(true)); err != nil {
+				// Strip the Authorization: Bearer header injected by Envoy's
+				// forwardAccessToken so it never reaches Ghost.
+				if err := stream.Send(requestHeadersContinue(true, nil, []string{"authorization"})); err != nil {
 					return fmt.Errorf("extproc: send (skip response): %w", err)
 				}
 			} else {
-				// New session created — store cookie value for response phase.
-				pendingCookie = signedCookie
-				if err := stream.Send(requestHeadersContinue(false)); err != nil {
-					return fmt.Errorf("extproc: send (await response): %w", err)
+				// No ghost session cookie in the browser yet. Issue a 302 redirect
+				// to /ghost/ with Set-Cookie so the browser stores the cookie and
+				// retries the request. On retry the cookie is present and the fast
+				// path fires, forwarding directly to Ghost.
+				//
+				// We always redirect to /ghost/ rather than echoing back the
+				// original :path for two reasons:
+				//   1. The :path may be a Ghost API endpoint (e.g. /ghost/api/admin/…)
+				//      triggered by the SPA — redirecting there returns JSON, which
+				//      the browser renders as a blank page instead of the admin UI.
+				//   2. The :path may carry Envoy OIDC state query-parameters that
+				//      confuse Ghost or cause a secondary redirect loop.
+				// Envoy's OIDC filter already restored the user to the correct URL
+				// before our ExtProc was invoked; our only job here is to plant the
+				// cookie so the next request reaches Ghost authenticated.
+				//
+				// Envoy Gateway strips Set-Cookie from the ExtProc response-headers
+				// phase and does not honour upstream Cookie mutations from ExtProc,
+				// so an ImmediateResponse is the only reliable delivery mechanism.
+				cookieHeader := s.buildSetCookieHeader(signedCookie)
+				s.logger.InfoContext(stream.Context(), "issuing cookie-set redirect",
+					slog.String("redirect_target", ghostAdminPath))
+				if err := stream.Send(immediateRedirectWithCookie(ghostAdminPath, cookieHeader)); err != nil {
+					return fmt.Errorf("extproc: send (cookie redirect): %w", err)
 				}
 			}
 
 		case *extprocv3.ProcessingRequest_ResponseHeaders:
-			if pendingCookie == "" {
-				if err := stream.Send(responseHeadersContinue(nil)); err != nil {
-					return fmt.Errorf("extproc: send (response pass-through): %w", err)
-				}
-				continue
-			}
-
-			cookieValue := buildSetCookieHeader(pendingCookie)
-			pendingCookie = "" // consume
-
-			injection := []*corev3.HeaderValueOption{{
-				Header: &corev3.HeaderValue{
-					Key:   "Set-Cookie",
-					Value: cookieValue,
-				},
-			}}
-			s.logger.DebugContext(stream.Context(), "injecting ghost session cookie")
-			if err := stream.Send(responseHeadersContinue(injection)); err != nil {
-				return fmt.Errorf("extproc: send (inject cookie): %w", err)
+			// With the redirect approach the fast path sets ModeOverride=SKIP and
+			// the slow path returns ImmediateResponse, so this phase should never
+			// fire. Pass through as a no-op if it arrives unexpectedly.
+			s.logger.WarnContext(stream.Context(), "unexpected response-headers phase; passing through")
+			if err := stream.Send(responseHeadersContinue(nil)); err != nil {
+				return fmt.Errorf("extproc: send (response pass-through): %w", err)
 			}
 		}
 	}
@@ -128,16 +154,64 @@ func (s *Server) Process(stream extprocv3.ExternalProcessor_ProcessServer) error
 
 // ─── Response builders ────────────────────────────────────────────────────────
 
+// immediateRedirectWithCookie returns a ProcessingResponse that short-circuits
+// the proxied request and sends a 302 redirect directly to the browser with a
+// Set-Cookie header. Envoy delivers ImmediateResponse bodies without running
+// them through the response-header filter chain, so the Set-Cookie reaches the
+// browser unmodified — unlike the ExtProc response-headers mutation path.
+func immediateRedirectWithCookie(path, cookieValue string) *extprocv3.ProcessingResponse {
+	return &extprocv3.ProcessingResponse{
+		Response: &extprocv3.ProcessingResponse_ImmediateResponse{
+			ImmediateResponse: &extprocv3.ImmediateResponse{
+				Status: &typev3.HttpStatus{
+					Code: typev3.StatusCode_Found, // 302
+				},
+				Headers: &extprocv3.HeaderMutation{
+					SetHeaders: []*corev3.HeaderValueOption{
+						{
+							Header: &corev3.HeaderValue{
+								Key:   "location",
+								Value: path,
+							},
+							// ExtProc filters must explicitly set OVERWRITE_IF_EXISTS_OR_ADD.
+							// Without it Envoy Gateway delivers the header with an empty value.
+							AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+						},
+						{
+							Header: &corev3.HeaderValue{
+								Key:   "set-cookie",
+								Value: cookieValue,
+							},
+							AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 // requestHeadersContinue returns a ProcessingResponse that continues the request.
 // When skipResponsePhase is true, a ModeOverride tells Envoy not to send
 // response headers to our ExtProc, saving a round-trip on the fast path.
-func requestHeadersContinue(skipResponsePhase bool) *extprocv3.ProcessingResponse {
+// requestMutations (optional) are applied to the upstream request headers.
+// removeHeaders (optional) lists header names to strip before Envoy forwards
+// the request — used to prevent the Envoy-injected "Authorization: Bearer"
+// access token from leaking to Ghost.
+func requestHeadersContinue(skipResponsePhase bool, requestMutations []*corev3.HeaderValueOption, removeHeaders []string) *extprocv3.ProcessingResponse {
+	common := &extprocv3.CommonResponse{
+		Status: extprocv3.CommonResponse_CONTINUE,
+	}
+	if len(requestMutations) > 0 || len(removeHeaders) > 0 {
+		common.HeaderMutation = &extprocv3.HeaderMutation{
+			SetHeaders:    requestMutations,
+			RemoveHeaders: removeHeaders,
+		}
+	}
 	resp := &extprocv3.ProcessingResponse{
 		Response: &extprocv3.ProcessingResponse_RequestHeaders{
 			RequestHeaders: &extprocv3.HeadersResponse{
-				Response: &extprocv3.CommonResponse{
-					Status: extprocv3.CommonResponse_CONTINUE,
-				},
+				Response: common,
 			},
 		},
 	}
@@ -150,7 +224,7 @@ func requestHeadersContinue(skipResponsePhase bool) *extprocv3.ProcessingRespons
 }
 
 // responseHeadersContinue returns a ProcessingResponse that continues the response,
-// optionally mutating headers (used to inject Set-Cookie).
+// optionally mutating headers.
 func responseHeadersContinue(extraHeaders []*corev3.HeaderValueOption) *extprocv3.ProcessingResponse {
 	common := &extprocv3.CommonResponse{
 		Status: extprocv3.CommonResponse_CONTINUE,
@@ -169,10 +243,38 @@ func responseHeadersContinue(extraHeaders []*corev3.HeaderValueOption) *extprocv
 	}
 }
 
+// rawHeaderValue returns the value of the first header matching name
+// (case-insensitive), preferring RawValue over Value.
+func rawHeaderValue(headers []*corev3.HeaderValue, name string) string {
+	for _, h := range headers {
+		if strings.EqualFold(h.GetKey(), name) {
+			if raw := h.GetRawValue(); len(raw) > 0 {
+				return string(raw)
+			}
+			return h.GetValue()
+		}
+	}
+	return ""
+}
+
+// appendCookie appends name=value to an existing Cookie header string.
+// If existing is empty the result is just the new pair; otherwise a "; "
+// separator is inserted so the resulting header remains valid.
+func appendCookie(existing, name, value string) string {
+	entry := name + "=" + value
+	if existing == "" {
+		return entry
+	}
+	return existing + "; " + entry
+}
+
 // buildSetCookieHeader formats the Set-Cookie header value for the ghost session.
-func buildSetCookieHeader(signedCookieValue string) string {
+// SameSite=None is required to match Ghost's own session cookie so that the
+// browser sends it on the cross-origin admin API requests the Ghost SPA makes.
+// SameSite=None mandates Secure=true, which we always include.
+func (s *Server) buildSetCookieHeader(signedCookieValue string) string {
 	return fmt.Sprintf(
-		"%s=%s; Path=/ghost; HttpOnly; Secure; SameSite=Lax; Max-Age=%d",
-		ghostSessionCookieName, signedCookieValue, cookieMaxAge,
+		"%s=%s; Path=/ghost; HttpOnly; Secure; SameSite=None; Max-Age=%d",
+		ghostSessionCookieName, signedCookieValue, s.sessionMaxAgeSecs,
 	)
 }

@@ -81,7 +81,7 @@ func TestGenerateSessionID_Length(t *testing.T) {
 }
 
 func TestGenerateSessionID_URLSafe(t *testing.T) {
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		id, err := generateSessionID()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -94,7 +94,7 @@ func TestGenerateSessionID_URLSafe(t *testing.T) {
 
 func TestGenerateSessionID_Unique(t *testing.T) {
 	seen := make(map[string]bool, 50)
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		id, err := generateSessionID()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -133,7 +133,7 @@ func TestGenerateObjectID_HexOnly(t *testing.T) {
 
 func TestGenerateObjectID_Unique(t *testing.T) {
 	seen := make(map[string]bool, 50)
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		id, err := generateObjectID()
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -148,7 +148,7 @@ func TestGenerateObjectID_Unique(t *testing.T) {
 // ─── buildSessionData ────────────────────────────────────────────────────────
 
 func TestBuildSessionData_ValidJSON(t *testing.T) {
-	raw, err := buildSessionData("user001")
+	raw, err := buildSessionData("user001", defaultSessionMaxAgeDays)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -170,14 +170,22 @@ func TestBuildSessionData_ValidJSON(t *testing.T) {
 	if !parsed.Cookie.Secure {
 		t.Fatal("cookie.secure should be true")
 	}
-	if parsed.Cookie.SameSite != "lax" {
-		t.Fatalf("cookie.sameSite: got %q, want lax", parsed.Cookie.SameSite)
+	// Must match Ghost's own value ("none") so the cookie is sent on
+	// cross-origin admin API calls made by the Ghost SPA.
+	if parsed.Cookie.SameSite != "none" {
+		t.Fatalf("cookie.sameSite: got %q, want none", parsed.Cookie.SameSite)
 	}
-	if parsed.Cookie.OriginalMaxAge != nil {
-		t.Fatal("cookie.originalMaxAge should be null")
+	// Ghost uses 180-day sessions (15552000000 ms).
+	wantMaxAge := int64(defaultSessionMaxAgeDays * 24 * 60 * 60 * 1000)
+	if parsed.Cookie.OriginalMaxAge != wantMaxAge {
+		t.Fatalf("cookie.originalMaxAge: got %d, want %d", parsed.Cookie.OriginalMaxAge, wantMaxAge)
 	}
-	if parsed.Cookie.Expires != nil {
-		t.Fatal("cookie.expires should be null")
+	if parsed.Cookie.Expires == "" {
+		t.Fatal("cookie.expires should be a non-empty ISO-8601 string")
+	}
+	// Ghost 6.x requires verified=true; without it the admin API returns 403.
+	if !parsed.Verified {
+		t.Fatal("verified should be true")
 	}
 }
 
@@ -188,7 +196,7 @@ func TestBuildSessionData_UserIDPreserved(t *testing.T) {
 		"",
 	}
 	for _, uid := range userIDs {
-		raw, err := buildSessionData(uid)
+		raw, err := buildSessionData(uid, defaultSessionMaxAgeDays)
 		if err != nil {
 			t.Fatalf("buildSessionData(%q): unexpected error: %v", uid, err)
 		}

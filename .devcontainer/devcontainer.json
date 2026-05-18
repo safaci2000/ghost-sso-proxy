@@ -17,7 +17,9 @@
   "features": {
     // Gives the dev container access to the host Docker daemon so you can run
     // `docker compose` commands against the outer socket (Docker-outside-of-Docker).
-    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+      "moby": false
+    },
     // Go toolchain — matches the version in go.mod.
     "ghcr.io/devcontainers/features/go:1": {
       "version": "1.24"
@@ -25,7 +27,7 @@
   },
 
   // Install project tooling once the container is ready.
-  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postCreateCommand": "bash /workspace/.devcontainer/post-create.sh",
 
   "customizations": {
     "vscode": {

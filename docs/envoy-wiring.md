@@ -29,7 +29,7 @@ spec:
     spec:
       containers:
         - name: ghost-sso-proxy
-          image: ghcr.io/<owner>/ghost-sso-proxy:latest
+          image: ghcr.io/safaci2000/ghost-sso-proxy:latest
           ports:
             - name: grpc
               containerPort: 8080
@@ -123,7 +123,10 @@ spec:
         request:
           headers: SEND          # proxy inspects request cookies
         response:
-          headers: SEND          # proxy injects Set-Cookie on new sessions
+          headers: SKIP          # proxy uses ImmediateResponse in the request phase;
+                                 # it never needs the response phase. SEND would route
+                                 # the ImmediateResponse through the OIDC filter chain,
+                                 # which strips Set-Cookie and delivers it empty.
       failOpen: true             # pass through if the proxy is unavailable
       messageTimeout: 5s
 ```
@@ -164,10 +167,10 @@ spec:
 
 | Phase | Mode | Why |
 |---|---|---|
-| Request headers | `SEND` | Proxy needs to read the `cookie` header to find `IdToken-*` and check for an existing `ghost-admin-api-session`. |
-| Response headers | `SEND` | Proxy injects `Set-Cookie` on the first request of a new session. On subsequent requests the fast-path fires and the proxy tells Envoy to skip the response phase via `ModeOverride = SKIP`. |
-| Request body | (not set / `SKIP`) | Not needed. |
-| Response body | (not set / `SKIP`) | Not needed. |
+| Request headers | `SEND` | Proxy reads the `cookie` header to find `IdToken-*` and check for an existing `ghost-admin-api-session`. |
+| Response headers | `SKIP` | Proxy delivers `Set-Cookie` via an `ImmediateResponse` 302 redirect in the **request** phase — the response phase is never used. Setting this to `SEND` routes the `ImmediateResponse` through Envoy's response filter chain, where the OIDC SecurityPolicy strips `Set-Cookie`, leaving it blank. |
+| Request body | `SKIP` | Not needed. |
+| Response body | `SKIP` | Not needed. |
 
 ## Secret shapes
 

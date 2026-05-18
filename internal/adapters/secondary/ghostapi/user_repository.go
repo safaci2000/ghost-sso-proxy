@@ -5,12 +5,10 @@ package ghostapi
 
 import (
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -24,25 +22,6 @@ type UserRepository struct {
 	keyID    string
 	secret   []byte
 	client   *http.Client
-}
-
-// NewUserRepository parses the Ghost Admin API key and constructs a UserRepository.
-// apiKey must be in Ghost's "<id>:<hex-encoded-secret>" format.
-func NewUserRepository(adminURL, apiKey string) (*UserRepository, error) {
-	parts := strings.SplitN(apiKey, ":", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return nil, fmt.Errorf("ghostapi: invalid Admin API key format — expected \"<id>:<hex-secret>\"")
-	}
-	secret, err := hex.DecodeString(parts[1])
-	if err != nil {
-		return nil, fmt.Errorf("ghostapi: decoding Admin API key secret: %w", err)
-	}
-	return &UserRepository{
-		adminURL: strings.TrimRight(adminURL, "/"),
-		keyID:    parts[0],
-		secret:   secret,
-		client:   &http.Client{Timeout: 10 * time.Second},
-	}, nil
 }
 
 // ghostUsersResponse mirrors the Ghost Admin API /users/ response envelope.

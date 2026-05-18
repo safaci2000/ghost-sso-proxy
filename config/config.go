@@ -21,17 +21,33 @@ type Config struct {
 
 	// LogLevel controls slog verbosity: "debug", "info", "warn", "error".
 	LogLevel string
+
+	// SessionMaxAgeDays controls the lifetime of the Ghost admin session cookie
+	// and the session_data.cookie.originalMaxAge written to the DB.
+	// Defaults to 180 days, matching Ghost's default session lifetime.
+	// Override with SESSION_MAX_AGE_DAYS if your Ghost instance is configured
+	// with a shorter or longer session timeout.
+	SessionMaxAgeDays int
+
+	// OIDCUserInfoURL is the OIDC provider's userinfo endpoint.
+	// ExtAuth calls this with the forwarded access token to resolve the user's
+	// email when the access token is opaque (or the provider doesn't embed claims
+	// in the access token JWT).
+	// Example: https://auth.example.com/application/o/envoy-oidc/userinfo/
+	// When empty the decoder falls back to local JWT decoding (local dev only).
+	OIDCUserInfoURL string
 }
 
 // Load reads configuration from environment variables.
 // Required variables: DB_USER, DB_PASSWORD.
 func Load() (*Config, error) {
 	cfg := &Config{
-		DBHost:     env("DB_HOST", "mariadb.mariadb.svc.cluster.local"),
-		DBName:     env("DB_NAME", "ghost"),
-		DBUser:     mustEnv("DB_USER"),
-		DBPassword: mustEnv("DB_PASSWORD"),
-		LogLevel:   env("LOG_LEVEL", "info"),
+		DBHost:          env("DB_HOST", "mariadb.mariadb.svc.cluster.local"),
+		DBName:          env("DB_NAME", "ghost"),
+		DBUser:          mustEnv("DB_USER"),
+		DBPassword:      mustEnv("DB_PASSWORD"),
+		LogLevel:        env("LOG_LEVEL", "info"),
+		OIDCUserInfoURL: env("OIDC_USERINFO_URL", ""),
 	}
 
 	var err error
@@ -42,6 +58,13 @@ func Load() (*Config, error) {
 	cfg.GRPCPort, err = strconv.Atoi(env("GRPC_PORT", "8080"))
 	if err != nil {
 		return nil, fmt.Errorf("config: invalid GRPC_PORT: %w", err)
+	}
+	cfg.SessionMaxAgeDays, err = strconv.Atoi(env("SESSION_MAX_AGE_DAYS", "180"))
+	if err != nil {
+		return nil, fmt.Errorf("config: invalid SESSION_MAX_AGE_DAYS: %w", err)
+	}
+	if cfg.SessionMaxAgeDays <= 0 {
+		return nil, fmt.Errorf("config: SESSION_MAX_AGE_DAYS must be > 0, got %d", cfg.SessionMaxAgeDays)
 	}
 	return cfg, nil
 }

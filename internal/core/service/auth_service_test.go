@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-
 	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
 )
 
@@ -20,7 +18,7 @@ type mockDecoder struct {
 	err      error
 }
 
-func (m *mockDecoder) Decode(_ context.Context, _ string) (*domain.Identity, error) {
+func (m *mockDecoder) Decode(_ context.Context, _, _ string) (*domain.Identity, error) {
 	return m.identity, m.err
 }
 
@@ -57,14 +55,6 @@ func newTestService(dec *mockDecoder, users *mockUserRepo, sess *mockSessionStor
 	return New(dec, users, sess, logger)
 }
 
-func headers(pairs ...string) []*corev3.HeaderValue {
-	var out []*corev3.HeaderValue
-	for i := 0; i+1 < len(pairs); i += 2 {
-		out = append(out, &corev3.HeaderValue{Key: pairs[i], Value: pairs[i+1]})
-	}
-	return out
-}
-
 const (
 	ghostSessionCookie = "ghost-admin-api-session=s:abc.xyz"
 	idTokenCookie      = "IdToken-abc123=eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJzdWIiOiIxMjM0In0.sig"
@@ -80,7 +70,7 @@ func TestEnsureSession_FastPath(t *testing.T) {
 	)
 
 	cookieVal := ghostSessionCookie + "; other=stuff"
-	got, err := svc.EnsureSession(context.Background(), headers("cookie", cookieVal))
+	got, err := svc.EnsureSession(context.Background(), cookieVal, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -98,7 +88,7 @@ func TestEnsureSession_NoToken(t *testing.T) {
 		&mockSessionStore{},
 	)
 
-	_, err := svc.EnsureSession(context.Background(), headers("cookie", "other=val"))
+	_, err := svc.EnsureSession(context.Background(), "other=val", "")
 	if !errors.Is(err, domain.ErrNoToken) {
 		t.Fatalf("expected ErrNoToken, got %v", err)
 	}
@@ -113,7 +103,7 @@ func TestEnsureSession_UserNotFound(t *testing.T) {
 		&mockSessionStore{},
 	)
 
-	_, err := svc.EnsureSession(context.Background(), headers("cookie", idTokenCookie))
+	_, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
 	if !errors.Is(err, domain.ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
 	}
@@ -128,7 +118,7 @@ func TestEnsureSession_UserInactive(t *testing.T) {
 		&mockSessionStore{},
 	)
 
-	_, err := svc.EnsureSession(context.Background(), headers("cookie", idTokenCookie))
+	_, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
 	if !errors.Is(err, domain.ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
 	}
@@ -150,7 +140,7 @@ func TestEnsureSession_ReuseExisting(t *testing.T) {
 		store,
 	)
 
-	got, err := svc.EnsureSession(context.Background(), headers("cookie", idTokenCookie))
+	got, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -178,7 +168,7 @@ func TestEnsureSession_CreateNew(t *testing.T) {
 		store,
 	)
 
-	got, err := svc.EnsureSession(context.Background(), headers("cookie", idTokenCookie))
+	got, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -201,38 +191,9 @@ func TestEnsureSession_CreateError(t *testing.T) {
 		store,
 	)
 
-	_, err := svc.EnsureSession(context.Background(), headers("cookie", idTokenCookie))
+	_, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
 	if err == nil {
 		t.Fatal("expected error, got nil")
-	}
-}
-
-// ─── Test: headerValue helper ─────────────────────────────────────────────────
-
-func TestHeaderValue(t *testing.T) {
-	hdrs := headers("Cookie", "a=1", "X-Request-ID", "req-42")
-
-	if v := headerValue(hdrs, "cookie"); v != "a=1" {
-		t.Fatalf("expected a=1, got %q", v)
-	}
-	if v := headerValue(hdrs, "COOKIE"); v != "a=1" {
-		t.Fatalf("case-insensitive lookup failed, got %q", v)
-	}
-	if v := headerValue(hdrs, "x-request-id"); v != "req-42" {
-		t.Fatalf("expected req-42, got %q", v)
-	}
-	if v := headerValue(hdrs, "missing"); v != "" {
-		t.Fatalf("expected empty for missing header, got %q", v)
-	}
-}
-
-// headerValue prefers RawValue over Value when both are present.
-func TestHeaderValue_RawValuePreferred(t *testing.T) {
-	hdrs := []*corev3.HeaderValue{
-		{Key: "cookie", Value: "string-value", RawValue: []byte("raw-value")},
-	}
-	if v := headerValue(hdrs, "cookie"); v != "raw-value" {
-		t.Fatalf("expected raw-value, got %q", v)
 	}
 }
 

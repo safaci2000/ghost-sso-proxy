@@ -3,6 +3,7 @@ package mariadb
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
@@ -32,7 +33,7 @@ func (r *UserRepository) FindByEmail(ctx context.Context, email string) (*domain
 
 	var u domain.User
 	if err := row.Scan(&u.ID, &u.Email, &u.Status); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, domain.ErrUserNotFound
 		}
 		return nil, fmt.Errorf("mariadb: querying users: %w", err)

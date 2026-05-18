@@ -1,0 +1,7 @@
+#FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:latest
+
+ARG TARGETPLATFORM
+COPY ${TARGETPLATFORM}/ghost-sso-proxy /ghost-sso-proxy
+
+ENTRYPOINT ["/ghost-sso-proxy"]

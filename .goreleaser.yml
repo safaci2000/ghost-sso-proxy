@@ -24,7 +24,6 @@ builds:
     # Embed version info at link time (same as Magefile).
     ldflags:
       - -s -w
-      - -trimpath
       - -X main.version={{.Version}}
       - -X main.commit={{.Commit}}
       - -X main.date={{.Date}}
@@ -34,19 +33,17 @@ builds:
 
 # ── Archives ──────────────────────────────────────────────────────────────────
 archives:
-  - id: default
-    builds:
+  - ids:
       - ghost-sso-proxy
     name_template: >-
       {{ .ProjectName }}_
       {{- .Version }}_
       {{- .Os }}_
       {{- .Arch }}
-    format: tar.gz
     # Windows users get a zip if we ever add windows builds.
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [ 'zip' ]
     files:
       - README.md
       - LICENSE*
@@ -58,53 +55,32 @@ checksum:
   algorithm: sha256
 
 # ── Docker ────────────────────────────────────────────────────────────────────
-dockers:
-  - id: linux-amd64
-    goos: linux
-    goarch: amd64
-    image_templates:
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}-amd64"
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest-amd64"
-    dockerfile: Dockerfile
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/amd64"
-      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
-      - "--label=org.opencontainers.image.version={{ .Version }}"
-      - "--label=org.opencontainers.image.revision={{ .Commit }}"
-      - "--label=org.opencontainers.image.created={{ .Date }}"
-      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy"
+dockers_v2:
+  - id: ghost-sso-proxy
+    images:
+      - "ghcr.io/safaci2000/ghost-sso-proxy"
+    dockerfile: "docker/Dockerfile.release"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    tags:
+      - "{{ .Version }}"
+      - "{{ .RawVersion }}"
+      - "{{ if not .IsNightly }}latest{{ end }}"
+    labels:
+      "org.opencontainers.image.description": "Ghost SSO Proxy"
+      "org.opencontainers.image.created": "{{.Date}}"
+      "org.opencontainers.image.name": "{{.ProjectName}}"
+      "org.opencontainers.image.revision": "{{.FullCommit}}"
+      "org.opencontainers.image.version": "{{.Version}}"
+      "org.opencontainers.image.source": "{{.GitURL}}"
 
-  - id: linux-arm64
-    goos: linux
-    goarch: arm64
-    image_templates:
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}-arm64"
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest-arm64"
-    dockerfile: Dockerfile
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
-      - "--label=org.opencontainers.image.version={{ .Version }}"
-      - "--label=org.opencontainers.image.revision={{ .Commit }}"
-      - "--label=org.opencontainers.image.created={{ .Date }}"
-      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy"
 
-docker_manifests:
-  - name_template: "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}-amd64"
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}-arm64"
-  - name_template: "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest"
-    image_templates:
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest-amd64"
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest-arm64"
 
 # ── GitHub Release ────────────────────────────────────────────────────────────
 release:
   github:
-    owner: "{{ .Env.GITHUB_REPOSITORY_OWNER }}"
+    owner: "safaci2000"
     name: ghost-sso-proxy
   draft: false
   prerelease: auto

@@ -9,7 +9,8 @@ import (
 // SessionStore reads and writes Ghost admin sessions in the database.
 // Ghost stores sessions in the `sessions` table; the cookie value is an
 // express-session signed ID ("s:<id>.<hmac>") where the HMAC key is the
-// Ghost db_hash setting read from the `settings` table at startup.
+// Ghost admin_session_secret setting read from the `settings` table at startup.
+// (db_hash is used for password-reset tokens, not session cookie signing.)
 type SessionStore interface {
 	// FindByUserID returns the most recent existing session for a Ghost user ID,
 	// or (nil, nil) when none exists.
