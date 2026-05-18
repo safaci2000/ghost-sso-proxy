@@ -1,0 +1,32 @@
+services:
+
+  db:
+    image: mariadb:12.2
+    restart: unless-stopped
+    env_file: devel.env
+    ports:
+      - "3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  ghost:
+    image: ghost:6-alpine
+    restart: unless-stopped
+    env_file: devel.env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "2368:2368"
+    volumes:
+      - ghost_content:/var/lib/ghost/content
+
+volumes:
+  db_data:
+  ghost_content:
