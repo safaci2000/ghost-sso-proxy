@@ -1,0 +1,54 @@
+{
+  "name": "ghost-sso-proxy",
+
+  // Compose-based devcontainer: the dev shell + Ghost + MariaDB all start together.
+  "dockerComposeFile": ["../docker-compose.yml", "docker-compose.devcontainer.yml"],
+  "service": "devcontainer",
+  "workspaceFolder": "/workspace",
+
+  // Forward Ghost and the gRPC port so you can hit them from the host.
+  "forwardPorts": [2368, 8080, 3306],
+  "portsAttributes": {
+    "2368": { "label": "Ghost", "onAutoForward": "notify" },
+    "8080": { "label": "ghost-sso-proxy gRPC", "onAutoForward": "silent" },
+    "3306": { "label": "MariaDB", "onAutoForward": "silent" }
+  },
+
+  "features": {
+    // Gives the dev container access to the host Docker daemon so you can run
+    // `docker compose` commands against the outer socket (Docker-outside-of-Docker).
+    "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {},
+    // Go toolchain — matches the version in go.mod.
+    "ghcr.io/devcontainers/features/go:1": {
+      "version": "1.24"
+    }
+  },
+
+  // Install project tooling once the container is ready.
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "ms-vscode.makefile-tools",
+        "redhat.vscode-yaml",
+        "editorconfig.editorconfig"
+      ],
+      "settings": {
+        "go.toolsManagement.autoUpdate": true,
+        "go.lintTool": "golangci-lint",
+        "go.lintOnSave": "package",
+        "go.testFlags": ["-v", "-race"],
+        "editor.formatOnSave": true,
+        "[go]": {
+          "editor.defaultFormatter": "golang.go"
+        }
+      }
+    }
+  },
+
+  // Run as root inside the devcontainer to avoid bind-mount permission issues.
+  // The MariaDB / Ghost containers still run as their own non-root users.
+  "remoteUser": "root"
+}

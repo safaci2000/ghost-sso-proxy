@@ -1,0 +1,161 @@
+version: 2
+
+# ── Project ───────────────────────────────────────────────────────────────────
+project_name: ghost-sso-proxy
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod verify
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+builds:
+  - id: ghost-sso-proxy
+    main: ./cmd
+    binary: ghost-sso-proxy
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    # Embed version info at link time (same as Magefile).
+    ldflags:
+      - -s -w
+      - -trimpath
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    flags:
+      - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+# ── Archives ──────────────────────────────────────────────────────────────────
+archives:
+  - id: default
+    builds:
+      - ghost-sso-proxy
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    format: tar.gz
+    # Windows users get a zip if we ever add windows builds.
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE*
+      - docs/**
+
+# ── Checksums ─────────────────────────────────────────────────────────────────
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+dockers:
+  - id: linux-amd64
+    goos: linux
+    goarch: amd64
+    image_templates:
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}-amd64"
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest-amd64"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .Commit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy"
+
+  - id: linux-arm64
+    goos: linux
+    goarch: arm64
+    image_templates:
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}-arm64"
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest-arm64"
+    dockerfile: Dockerfile
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .Commit }}"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy"
+
+docker_manifests:
+  - name_template: "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}-amd64"
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest"
+    image_templates:
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest-amd64"
+      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:latest-arm64"
+
+# ── GitHub Release ────────────────────────────────────────────────────────────
+release:
+  github:
+    owner: "{{ .Env.GITHUB_REPOSITORY_OWNER }}"
+    name: ghost-sso-proxy
+  draft: false
+  prerelease: auto
+  name_template: "{{ .ProjectName }} {{ .Tag }}"
+  header: |
+    ## ghost-sso-proxy {{ .Tag }}
+
+    Envoy ExtProc shim that bridges OIDC → Ghost admin sessions.
+
+    ### Docker
+
+    ```bash
+    docker pull ghcr.io/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy:{{ .Version }}
+    ```
+  footer: |
+    **Full Changelog**: https://github.com/{{ .Env.GITHUB_REPOSITORY_OWNER }}/ghost-sso-proxy/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+# ── Changelog ─────────────────────────────────────────────────────────────────
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: "Breaking Changes"
+      regexp: "^.*!:.*$"
+      order: 0
+    - title: Features
+      regexp: "^.*feat.*:.*$"
+      order: 1
+    - title: Bug Fixes
+      regexp: "^.*fix.*:.*$"
+      order: 2
+    - title: Performance
+      regexp: "^.*perf.*:.*$"
+      order: 3
+    - title: Other
+      order: 999
+
+# ── Signing (optional — enable if you have a GPG key in CI) ──────────────────
+# signs:
+#   - artifacts: checksum
+#     args:
+#       - "--batch"
+#       - "--local-user={{ .Env.GPG_FINGERPRINT }}"
+#       - "--output=${signature}"
+#       - "--detach-sign"
+#       - "${artifact}"

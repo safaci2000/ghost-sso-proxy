@@ -1,0 +1,48 @@
+# Extends the root docker-compose.yml with a devcontainer service.
+# The devcontainer is the Go development shell; Ghost + MariaDB come
+# from the parent compose file and are available as "db" and "ghost".
+#
+# Usage (VS Code / GitHub Codespaces):
+#   Open the repo — the Dev Containers extension picks this up automatically.
+#
+# Usage (CLI with the devcontainer CLI):
+#   devcontainer up --workspace-folder .
+#   devcontainer exec --workspace-folder . bash
+#
+# Usage (raw docker compose, no devcontainer CLI):
+#   docker compose -f docker-compose.yml -f .devcontainer/docker-compose.devcontainer.yml up -d
+#   docker compose exec devcontainer bash
+
+services:
+  devcontainer:
+    image: mcr.microsoft.com/devcontainers/base:debian
+    volumes:
+      # Bind-mount the repo into the container.
+      - ..:/workspace:cached
+      # Persist Go module cache and build cache between rebuilds.
+      - go-mod-cache:/root/go/pkg/mod
+      - go-build-cache:/root/.cache/go-build
+    # Keep the container alive; VS Code / devcontainer CLI attach to it.
+    command: sleep infinity
+    working_dir: /workspace
+    environment:
+      # Point the proxy at the MariaDB service from the parent compose file.
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_NAME: ghost
+      DB_USER: ghost
+      DB_PASSWORD: ghostpassword
+      GRPC_PORT: "8080"
+      LOG_LEVEL: debug
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+    # Attach to the same network as Ghost and MariaDB (defined in the parent file).
+    networks:
+      - default
+
+volumes:
+  go-mod-cache:
+  go-build-cache:
