@@ -6,10 +6,9 @@ import "context"
 // It inspects incoming request headers and decides whether a Ghost admin session
 // cookie needs to be created and injected into the response.
 type AuthService interface {
-	// EnsureSession inspects the cookie and authorization headers forwarded by
-	// Envoy. If a valid ghost-admin-api-session cookie is already present it
-	// returns ("", nil) signalling no action is needed. Otherwise it decodes the
-	// OIDC identity, verifies the user is active Ghost staff, and returns the
-	// signed cookie value to be injected via Set-Cookie in the response.
-	EnsureSession(ctx context.Context, cookieHeader, authHeader string) (signedCookieValue string, err error)
+	// EnsureSession checks whether a Ghost admin session cookie is already
+	// present (fast path: returns "", nil) or creates one for the given email.
+	// The caller (the ExtAuth adapter) is responsible for resolving the user's
+	// email before invoking this method — e.g. via Authentik forward auth.
+	EnsureSession(ctx context.Context, cookieHeader, email string) (signedCookieValue string, err error)
 }

@@ -2,74 +2,80 @@
 
 ## Problem
 
-Ghost does not natively support OIDC or SSO. Its admin panel uses express-session cookies signed with a secret (`db_hash`) stored in the database. To log a user in, Ghost requires either a password POST or a pre-existing signed session cookie.
-
-Envoy Gateway's OIDC filter can handle the provider round-trip and validate ID tokens, but it has no way to turn that validation into a Ghost session.
+Ghost does not natively support OIDC or SSO. Its admin panel uses express-session cookies signed with a secret (`admin_session_secret`) stored in the database. To log a user in, Ghost requires either a password POST or a pre-existing signed session cookie.
 
 ## Solution
 
-`ghost-sso-proxy` is an Envoy [External Processor](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter) (ExtProc) that runs as a sidecar or standalone gRPC service. Envoy calls it for every HTTP request that reaches Ghost's admin route. The proxy:
+`ghost-sso-proxy` is an Envoy [External Authorization](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_authz_filter) (ExtAuth) service. Envoy calls it for every request that reaches Ghost's admin route via a `SecurityPolicy`. The proxy:
 
-1. Checks whether a valid `ghost-admin-api-session` cookie is already present (fast path — no DB hit).
-2. Decodes the OIDC ID token Envoy placed in the `IdToken-*` cookie (no re-verification; Envoy already validated the signature against the provider's JWKS).
-3. Looks up the identity's email in Ghost's `users` table and confirms the account is active.
-4. Finds or creates a session row in Ghost's `sessions` table.
-5. Signs the session ID with Ghost's `db_hash` using the same algorithm as express-session (`s:<id>.<HMAC-SHA256>`).
-6. Injects a `Set-Cookie` response header so the browser stores the cookie. Ghost's SPA boots already authenticated.
+1. Checks whether a valid `ghost-admin-api-session` cookie is already present — fast path, no network calls.
+2. Calls the Authentik forward auth endpoint, forwarding the browser's cookie header so Authentik can validate its own proxy session cookie.
+3. If unauthenticated, returns a 302 redirect to the Authentik login flow.
+4. If authenticated, looks up the user's email in Ghost's `users` table and confirms the account is active.
+5. Finds or creates a session row in Ghost's `sessions` table.
+6. Signs the session ID using the same algorithm as express-session: `s:<id>.<base64(HMAC-SHA256(id, admin_session_secret))>`.
+7. Returns a `DeniedResponse` 302 redirect to `/ghost/` with `Set-Cookie`. Ghost's SPA boots already authenticated.
 
 ## Hexagonal architecture
 
-The code follows a ports-and-adapters (hexagonal) layout so that the core business logic has zero infrastructure dependencies and is easy to test.
+The code follows a ports-and-adapters (hexagonal) layout so the core business logic has zero infrastructure dependencies and is easy to test.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  PRIMARY ADAPTER                                            │
-│  internal/adapters/primary/extproc/server.go               │
-│  Envoy ExtProc gRPC server — drives AuthService            │
+│  internal/adapters/primary/extauth/server.go               │
+│  Envoy ExtAuth gRPC server — drives AuthService            │
+│    1. Fast path: ghost cookie present → OkResponse         │
+│    2. Call Authentik forward auth → email or redirectURL   │
+│    3. If redirectURL → DeniedResponse 302 (login flow)     │
+│    4. If email → AuthService.EnsureSession()               │
 └───────────────────┬─────────────────────────────────────────┘
                     │ calls primary.AuthService interface
 ┌───────────────────▼─────────────────────────────────────────┐
 │  CORE (no external deps)                                    │
 │  internal/core/service/auth_service.go                     │
-│  AuthService.EnsureSession()                               │
+│  AuthService.EnsureSession(cookieHeader, email)            │
 │    1. hasGhostSessionCookie? → return ""  (fast path)      │
-│    2. decoder.Decode()        → Identity                   │
-│    3. users.FindByEmail()     → User                       │
-│    4. sessions.FindByUserID() → *Session (reuse or nil)    │
-│    5. sessions.Create()       → Session                    │
-│    6. return SignedCookieValue                              │
-└───┬───────────────┬───────────────┬───────────────────────┘
-    │               │               │  depends on secondary port interfaces
-┌───▼──────┐ ┌──────▼──────┐ ┌──────▼───────────┐
-│oidctoken │ │  mariadb    │ │  mariadb         │
-│Decoder   │ │UserRepository│ │SessionStore      │
-│          │ │             │ │                  │
-│Decodes   │ │Queries      │ │Reads db_hash once│
-│IdToken-* │ │users table  │ │Finds/creates     │
-│JWT payload│ │by email     │ │session rows      │
-│(no verify)│ │             │ │Signs cookies     │
-└──────────┘ └─────────────┘ └──────────────────┘
+│    2. users.FindByEmail()     → User                       │
+│    3. sessions.FindByUserID() → *Session (reuse or nil)    │
+│    4. sessions.Create()       → Session                    │
+│    5. return SignedCookieValue                              │
+└───┬─────────────────────────────┬───────────────────────────┘
+    │                             │  depends on secondary port interfaces
+┌───▼──────────────────┐ ┌───────▼──────────────────────────┐
+│  authentik           │ │  mariadb                         │
+│  forward_auth.go     │ │  UserRepository + SessionStore   │
+│                      │ │                                  │
+│  Calls Authentik     │ │  Queries users table by email    │
+│  forward auth HTTP   │ │  Reads admin_session_secret once │
+│  endpoint; returns   │ │  Finds/creates session rows      │
+│  email or redirect   │ │  Signs cookies                   │
+└──────────────────────┘ └──────────────────────────────────┘
 ```
 
-## Request flow (happy path)
+## Request flow (happy path — first visit)
 
 ```
-1. Browser →  GET /ghost
-2. Envoy     →  OIDC filter: token valid, IdToken-<hash>=<jwt> cookie present
-3. Envoy     →  ExtProc: stream.Send(RequestHeaders{cookie: "IdToken-..."})
-4. Proxy     →  AuthService.EnsureSession(headers)
-               a) No ghost-admin-api-session cookie → proceed
-               b) Decode JWT payload → {email: "alice@example.com"}
-               c) SELECT * FROM users WHERE email = 'alice@example.com'
-               d) User.IsActive() → true
-               e) SELECT ... FROM sessions WHERE user_id = ? ORDER BY created_at DESC
-               f) Row found? → reuse. Not found? → INSERT new row, sign cookie
-5. Proxy     →  stream.Send(RequestHeaders CONTINUE, await response phase)
-6. Envoy     →  forwards request to Ghost; Ghost responds 200
-7. Envoy     →  stream.Send(ResponseHeaders{...})
-8. Proxy     →  stream.Send(ResponseHeaders CONTINUE + Set-Cookie mutation)
-9. Browser   →  stores ghost-admin-api-session cookie
-10. Browser  →  Ghost SPA boots, validates cookie via db_hash → authenticated ✓
+1. Browser        → GET /ghost/ (no ghost-admin-api-session cookie)
+2. Envoy          → ExtAuth Check RPC → ghost-auth-shim
+3. ghost-auth-shim → Authentik forward auth endpoint
+                     (forwarding browser Cookie header)
+4. Authentik      → 200 + X-Authentik-Email: user@example.com
+5. ghost-auth-shim → Ghost MariaDB: confirm user active, find/create session
+6. ghost-auth-shim → DeniedResponse 302 /ghost/ + Set-Cookie: ghost-admin-api-session=s:<id>.<sig>
+7. Browser        → stores cookie, follows redirect to /ghost/
+8. Envoy          → ExtAuth Check RPC (ghost cookie now present) → OkResponse (fast path)
+9. Ghost          → verifies HMAC, loads admin panel ✓
+```
+
+## Request flow (subsequent visits)
+
+```
+1. Browser        → GET /ghost/* (ghost-admin-api-session present)
+2. Envoy          → ExtAuth Check RPC → ghost-auth-shim
+3. ghost-auth-shim → fast path: cookie present → OkResponse immediately
+                     (no Authentik call, no DB hit)
+4. Ghost          → verifies HMAC, serves admin panel ✓
 ```
 
 ## Cookie signing
@@ -77,10 +83,12 @@ The code follows a ports-and-adapters (hexagonal) layout so that the core busine
 Ghost uses [express-session](https://github.com/expressjs/session) with cookie signing enabled. The signed cookie format is:
 
 ```
-s:<session_id>.<base64(HMAC-SHA256(session_id, db_hash))>
+s:<session_id>.<base64(HMAC-SHA256(session_id, admin_session_secret))>
 ```
 
-where trailing `=` padding is stripped from the base64 segment. The proxy reads `db_hash` once at startup from Ghost's `settings` table and uses it for all subsequent signing. This avoids a DB round-trip per request.
+where trailing `=` padding is stripped from the base64 segment. The proxy reads `admin_session_secret` once at startup from Ghost's `settings` table and uses it for all subsequent signing.
+
+Note: the signing key is `admin_session_secret` — not `db_hash`. The `db_hash` setting is used only by Ghost for password-reset tokens.
 
 ## Session ID format
 
@@ -90,6 +98,7 @@ Ghost's primary key (`id` column) is a MongoDB-style 24-hex-char ObjectId: 4-byt
 
 ## Security notes
 
-- The proxy trusts Envoy's OIDC validation and does **not** re-verify JWT signatures. This is intentional: signature verification is Envoy's responsibility. Ensure ExtProc is only reachable from Envoy (not publicly exposed).
-- The proxy only reads/writes the Ghost `users` and `sessions` tables. It does not touch passwords, content, or any other data.
-- Sessions have no explicit server-side expiry in this implementation (matching Ghost's default behavior). The `Max-Age=86400` cookie attribute is a client-side convenience only.
+- The proxy forwards the browser's cookie header verbatim to Authentik's forward auth endpoint. Authentik validates its own session cookie and is the source of truth for identity.
+- The proxy only reads/writes Ghost's `users` and `sessions` tables. It does not touch passwords, content, or any other data.
+- `DeniedResponse` is used for the cookie redirect (not `OkResponse` with header mutation) because Envoy Gateway strips `Set-Cookie` from `OkResponse` mutations. A `DeniedResponse` 302 bypasses the response-filter chain so `Set-Cookie` reaches the browser unmodified.
+- The proxy fails open on Authentik connectivity errors: if the forward auth call fails, the request passes through unauthenticated rather than hard-blocking. Ghost renders its own login page as a safe fallback.

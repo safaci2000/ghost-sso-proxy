@@ -16,7 +16,7 @@ type Config struct {
 	DBUser     string
 	DBPassword string
 
-	// GRPCPort is the port the ExtProc gRPC server listens on (default 8080).
+	// GRPCPort is the port the ExtAuth gRPC server listens on (default 8080).
 	GRPCPort int
 
 	// LogLevel controls slog verbosity: "debug", "info", "warn", "error".
@@ -24,30 +24,31 @@ type Config struct {
 
 	// SessionMaxAgeDays controls the lifetime of the Ghost admin session cookie
 	// and the session_data.cookie.originalMaxAge written to the DB.
-	// Defaults to 180 days, matching Ghost's default session lifetime.
-	// Override with SESSION_MAX_AGE_DAYS if your Ghost instance is configured
-	// with a shorter or longer session timeout.
+	// Shorter values are fine — when the Ghost session expires Authentik's
+	// forward auth re-issues a new one transparently (no user login prompt).
+	// Defaults to 30 days.
 	SessionMaxAgeDays int
 
-	// OIDCUserInfoURL is the OIDC provider's userinfo endpoint.
-	// ExtAuth calls this with the forwarded access token to resolve the user's
-	// email when the access token is opaque (or the provider doesn't embed claims
-	// in the access token JWT).
-	// Example: https://auth.example.com/application/o/envoy-oidc/userinfo/
-	// When empty the decoder falls back to local JWT decoding (local dev only).
-	OIDCUserInfoURL string
+	// AuthentikForwardAuthURL is the Authentik proxyv2 forward auth endpoint.
+	// The ExtAuth adapter forwards browser Cookie and X-Forwarded-* headers here;
+	// Authentik validates its proxy session and returns X-Authentik-Email (200)
+	// or a redirect to its login flow (302).
+	// Use the /auth/traefik path — the per-application path was removed in 2026.x.
+	// Example: https://auth.example.com/outpost.goauthentik.io/auth/traefik
+	// Required — the service panics at startup if this is not set.
+	AuthentikForwardAuthURL string
 }
 
 // Load reads configuration from environment variables.
-// Required variables: DB_USER, DB_PASSWORD.
+// Required variables: DB_USER, DB_PASSWORD, AUTHENTIK_FORWARD_AUTH_URL.
 func Load() (*Config, error) {
 	cfg := &Config{
-		DBHost:          env("DB_HOST", "mariadb.mariadb.svc.cluster.local"),
-		DBName:          env("DB_NAME", "ghost"),
-		DBUser:          mustEnv("DB_USER"),
-		DBPassword:      mustEnv("DB_PASSWORD"),
-		LogLevel:        env("LOG_LEVEL", "info"),
-		OIDCUserInfoURL: env("OIDC_USERINFO_URL", ""),
+		DBHost:                  env("DB_HOST", "mariadb.mariadb.svc.cluster.local"),
+		DBName:                  env("DB_NAME", "ghost"),
+		DBUser:                  mustEnv("DB_USER"),
+		DBPassword:              mustEnv("DB_PASSWORD"),
+		LogLevel:                env("LOG_LEVEL", "info"),
+		AuthentikForwardAuthURL: mustEnv("AUTHENTIK_FORWARD_AUTH_URL"),
 	}
 
 	var err error
@@ -59,7 +60,7 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: invalid GRPC_PORT: %w", err)
 	}
-	cfg.SessionMaxAgeDays, err = strconv.Atoi(env("SESSION_MAX_AGE_DAYS", "180"))
+	cfg.SessionMaxAgeDays, err = strconv.Atoi(env("SESSION_MAX_AGE_DAYS", "30"))
 	if err != nil {
 		return nil, fmt.Errorf("config: invalid SESSION_MAX_AGE_DAYS: %w", err)
 	}

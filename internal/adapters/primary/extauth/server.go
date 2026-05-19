@@ -4,28 +4,26 @@
 //
 // Flow per HTTP request (one unary Check RPC):
 //
-//  1. The OIDC filter in the SecurityPolicy runs first, authenticates with
-//     Authentik, and injects "Authorization: Bearer <jwt>" via forwardAccessToken.
-//  2. ExtAuth.Check is called with all request headers.
-//     — If a ghost-admin-api-session cookie already exists → OkResponse.
-//       Strip the Authorization header so it never reaches Ghost.
-//     — If a new signed cookie value is returned → DeniedResponse 302 to
-//       /ghost/ with Set-Cookie. The browser stores the cookie and retries;
-//       the retry hits the fast path above.
-//     — On any error → OkResponse (fail-open). Ghost renders its own login page
-//       as a safe fallback; we never hard-block a request.
+//  1. ExtAuth.Check is called with all request headers.
+//  2. The Authentik forward auth client checks whether the browser's Authentik
+//     proxy session cookie is valid.
+//     — Authentik 302: user not logged in → DeniedResponse 302 to Authentik login.
+//     — Authentik 200 + email: user authenticated → proceed to step 3.
+//     — Error: fail-open (OkResponse); Ghost's own login page is a safe fallback.
+//  3. If a ghost-admin-api-session cookie is already present → OkResponse (fast path).
+//  4. Otherwise: create/reuse a Ghost DB session → DeniedResponse 302 to /ghost/
+//     with Set-Cookie. The browser stores the cookie and retries; the retry hits
+//     the fast path in step 3.
 //
-//  Why DeniedResponse for the redirect: Envoy Gateway strips Set-Cookie from
-//  OkResponse header mutations. A DeniedResponse bypasses the response-filter
-//  chain entirely, so Set-Cookie is delivered to the browser unmodified.
+// Why DeniedResponse for the redirect: Envoy Gateway strips Set-Cookie from
+// OkResponse header mutations. A DeniedResponse bypasses the response-filter
+// chain entirely, so Set-Cookie reaches the browser unmodified.
 package extauth
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
@@ -33,8 +31,8 @@ import (
 	"google.golang.org/grpc/codes"
 	statuspb "google.golang.org/genproto/googleapis/rpc/status"
 
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
 	"github.com/safaci2000/ghost-sso-proxy/internal/core/ports/primary"
+	"github.com/safaci2000/ghost-sso-proxy/internal/core/ports/secondary"
 )
 
 const (
@@ -42,8 +40,7 @@ const (
 
 	// ghostAdminPath is the canonical redirect target after planting the session
 	// cookie. We always redirect here rather than echoing the original :path —
-	// API sub-paths and OIDC query-params in :path would cause a blank page or
-	// a secondary redirect loop.
+	// API sub-paths in :path would cause a blank page or a secondary redirect loop.
 	ghostAdminPath = "/ghost/"
 
 	// cookieMaxAge is the default Max-Age for the injected session cookie in
@@ -56,16 +53,18 @@ const (
 type Server struct {
 	authv3.UnimplementedAuthorizationServer
 	auth              primary.AuthService
+	authentik         secondary.ForwardAuthChecker
 	logger            *slog.Logger
 	sessionMaxAgeSecs int // Max-Age for the Set-Cookie header, in seconds
 }
 
-// NewServer constructs a Server driven by the provided AuthService.
-// sessionMaxAgeDays should come from cfg.SessionMaxAgeDays so the cookie
-// lifetime tracks the SESSION_MAX_AGE_DAYS environment variable.
-func NewServer(auth primary.AuthService, logger *slog.Logger, sessionMaxAgeDays int) *Server {
+// NewServer constructs a Server driven by the provided AuthService and
+// ForwardAuthChecker. sessionMaxAgeDays should come from cfg.SessionMaxAgeDays
+// so the cookie lifetime tracks the SESSION_MAX_AGE_DAYS environment variable.
+func NewServer(auth primary.AuthService, authentik secondary.ForwardAuthChecker, logger *slog.Logger, sessionMaxAgeDays int) *Server {
 	return &Server{
 		auth:              auth,
+		authentik:         authentik,
 		logger:            logger,
 		sessionMaxAgeSecs: sessionMaxAgeDays * 24 * 60 * 60,
 	}
@@ -75,90 +74,108 @@ func NewServer(auth primary.AuthService, logger *slog.Logger, sessionMaxAgeDays 
 func (s *Server) Check(ctx context.Context, req *authv3.CheckRequest) (*authv3.CheckResponse, error) {
 	headers := req.GetAttributes().GetRequest().GetHttp().GetHeaders()
 	cookieHeader := headers["cookie"]
-	authHeader := extractAuthHeader(req)
 
-	// Log a full diagnostic snapshot at DEBUG. This intentionally dumps header
-	// names (not values) and metadata namespace keys so we can diagnose filter-
-	// chain ordering and metadata_context_namespaces issues without leaking tokens.
-	if s.logger.Enabled(ctx, slog.LevelDebug) {
-		// Collect request header names.
-		hdrNames := make([]string, 0, len(headers))
-		for k := range headers {
-			hdrNames = append(hdrNames, k)
-		}
-		// Collect metadata context namespace keys.
-		var metaKeys []string
-		if filterMeta := req.GetAttributes().GetMetadataContext().GetFilterMetadata(); filterMeta != nil {
-			for k := range filterMeta {
-				metaKeys = append(metaKeys, k)
-			}
-		}
-		// Surface the raw oauth2 metadata fields if the namespace is present.
-		var oauth2Fields []string
-		if filterMeta := req.GetAttributes().GetMetadataContext().GetFilterMetadata(); filterMeta != nil {
-			if s, ok := filterMeta["envoy.filters.http.oauth2"]; ok && s != nil {
-				for k := range s.GetFields() {
-					oauth2Fields = append(oauth2Fields, k)
-				}
-			}
-		}
-		s.logger.DebugContext(ctx, "extauth check",
-			slog.Bool("has_bearer_token", strings.HasPrefix(authHeader, "Bearer ")),
-			slog.String("auth_source", authSource(req)),
-			slog.Bool("has_cookie_header", cookieHeader != ""),
-			slog.Any("request_header_names", hdrNames),
-			slog.Any("metadata_namespaces", metaKeys),
-			slog.Any("oauth2_metadata_fields", oauth2Fields),
-		)
+	// Extract forwarding fields for Authentik. Envoy sends HTTP/2 pseudo-headers
+	// (:authority, :scheme, :path) for all requests regardless of protocol.
+	host := firstNonEmpty(headers[":authority"], headers["host"])
+	proto := firstNonEmpty(headers[":scheme"], headers["x-forwarded-proto"])
+	uri := headers[":path"]
+
+	s.logger.DebugContext(ctx, "extauth check",
+		slog.Bool("has_cookie_header", cookieHeader != ""),
+		slog.String("host", host),
+		slog.String("proto", proto),
+		slog.String("uri", uri),
+	)
+
+	// ── Step 1: Authentik forward auth ───────────────────────────────────────
+	email, redirectURL, authentikCookies, err := s.authentik.Check(ctx, cookieHeader, host, proto, uri)
+	if err != nil {
+		s.logger.WarnContext(ctx, "authentik forward auth error, failing open",
+			slog.Any("error", err))
+		return okResponse(), nil
 	}
 
-	signedCookie, err := s.auth.EnsureSession(ctx, cookieHeader, authHeader)
+	if redirectURL != "" {
+		// Not authenticated — bounce the browser to Authentik's login flow.
+		// Forward any Set-Cookie headers from Authentik (PKCE state cookies)
+		// so the OAuth2 callback can complete. Without them the callback returns
+		// "invalid state" and the login loop never finishes.
+		s.logger.DebugContext(ctx, "authentik redirect, not authenticated",
+			slog.String("location", redirectURL),
+			slog.Int("proxy_cookies", len(authentikCookies)))
+		return deniedRedirectTo(redirectURL, authentikCookies), nil
+	}
+
+	// ── Step 2: ensure a Ghost session exists for this user ──────────────────
+	signedCookie, err := s.auth.EnsureSession(ctx, cookieHeader, email)
 	if err != nil {
-		// On any auth error, log and fail open. Ghost's own login page is a
-		// safe fallback; we never hard-block a request.
-		level := slog.LevelWarn
-		if errors.Is(err, domain.ErrNoToken) {
-			// Expected during the /oauth2/callback round-trip — not a real error.
-			level = slog.LevelDebug
-		}
-		s.logger.Log(ctx, level, "auth service error, failing open", slog.Any("error", err))
-		return okResponse([]string{"authorization"}), nil
+		s.logger.WarnContext(ctx, "auth service error, failing open",
+			slog.Any("error", err))
+		return okResponse(), nil
 	}
 
 	if signedCookie == "" {
-		// Fast path: session cookie already present. Pass through, stripping the
-		// Authorization header so the Bearer token never reaches Ghost.
-		return okResponse([]string{"authorization"}), nil
+		// Fast path: Ghost session cookie already present. Pass through.
+		return okResponse(), nil
 	}
 
-	// Slow path: no ghost session cookie yet. Issue a 302 redirect to /ghost/
+	// Slow path: no Ghost session cookie yet. Issue a 302 redirect to /ghost/
 	// with Set-Cookie so the browser stores the cookie and retries. On retry
 	// the cookie is present and the fast path fires.
 	//
-	// We always redirect to /ghost/ rather than echoing :path for two reasons:
-	//   1. :path may be a Ghost API endpoint (e.g. /ghost/api/admin/…) called
-	//      by the SPA — redirecting there returns JSON, which the browser
-	//      renders as a blank page instead of the admin UI.
-	//   2. :path may carry Envoy OIDC state query-parameters that confuse Ghost
-	//      or cause a secondary redirect loop.
+	// We always redirect to /ghost/ rather than echoing :path because :path may
+	// be a Ghost API endpoint called by the SPA — redirecting there returns JSON,
+	// which the browser renders as a blank page instead of the admin UI.
 	cookieVal := s.buildSetCookieHeader(signedCookie)
 	s.logger.InfoContext(ctx, "issuing cookie-set redirect",
-		slog.String("redirect_target", ghostAdminPath))
+		slog.String("redirect_target", ghostAdminPath),
+		slog.String("email", email))
 	return deniedRedirectWithCookie(ghostAdminPath, cookieVal), nil
 }
 
 // ─── Response builders ────────────────────────────────────────────────────────
 
 // okResponse returns a CheckResponse that allows the request to proceed.
-// headersToRemove lists headers to strip before the request reaches the upstream
-// — used to prevent the Envoy-injected "Authorization: Bearer" token from
-// leaking to Ghost.
-func okResponse(headersToRemove []string) *authv3.CheckResponse {
+func okResponse() *authv3.CheckResponse {
 	return &authv3.CheckResponse{
 		Status: &statuspb.Status{Code: int32(codes.OK)},
 		HttpResponse: &authv3.CheckResponse_OkResponse{
-			OkResponse: &authv3.OkHttpResponse{
-				HeadersToRemove: headersToRemove,
+			OkResponse: &authv3.OkHttpResponse{},
+		},
+	}
+}
+
+// deniedRedirectTo returns a CheckResponse that sends a 302 redirect to the
+// given URL — used to forward the browser to Authentik's login flow.
+// setCookies is the list of raw Set-Cookie header values from Authentik's 302
+// response (e.g. authentik_proxy_* PKCE state cookies); each is forwarded
+// as its own Set-Cookie response header so the browser stores the state token
+// needed to complete the OAuth2 callback.
+func deniedRedirectTo(url string, setCookies []string) *authv3.CheckResponse {
+	hdrs := make([]*corev3.HeaderValueOption, 0, 1+len(setCookies))
+	hdrs = append(hdrs, &corev3.HeaderValueOption{
+		Header: &corev3.HeaderValue{
+			Key:   "location",
+			Value: url,
+		},
+		AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+	})
+	for _, cookie := range setCookies {
+		hdrs = append(hdrs, &corev3.HeaderValueOption{
+			Header: &corev3.HeaderValue{
+				Key:   "set-cookie",
+				Value: cookie,
+			},
+			AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+		})
+	}
+	return &authv3.CheckResponse{
+		Status: &statuspb.Status{Code: int32(codes.PermissionDenied)},
+		HttpResponse: &authv3.CheckResponse_DeniedResponse{
+			DeniedResponse: &authv3.DeniedHttpResponse{
+				Status:  &typev3.HttpStatus{Code: typev3.StatusCode_Found},
+				Headers: hdrs,
 			},
 		},
 	}
@@ -173,9 +190,7 @@ func deniedRedirectWithCookie(path, cookieValue string) *authv3.CheckResponse {
 		Status: &statuspb.Status{Code: int32(codes.PermissionDenied)},
 		HttpResponse: &authv3.CheckResponse_DeniedResponse{
 			DeniedResponse: &authv3.DeniedHttpResponse{
-				Status: &typev3.HttpStatus{
-					Code: typev3.StatusCode_Found, // 302
-				},
+				Status: &typev3.HttpStatus{Code: typev3.StatusCode_Found},
 				Headers: []*corev3.HeaderValueOption{
 					{
 						Header: &corev3.HeaderValue{
@@ -208,65 +223,12 @@ func (s *Server) buildSetCookieHeader(signedCookieValue string) string {
 	)
 }
 
-// extractAuthHeader returns the best available "Authorization: Bearer <token>"
-// string for this request.
-//
-// Preference order:
-//  1. The Authorization header injected by an upstream filter (e.g. if Envoy
-//     ever wires forwardAccessToken into ExtAuth's view of the request).
-//  2. The raw access token from the Envoy oauth2 filter's dynamic metadata —
-//     the standard production path. Envoy writes the decrypted access token
-//     under metadata_context["envoy.filters.http.oauth2"]["access_token"]
-//     before calling ExtAuth.
-//
-// Returns "" when neither source has a token (no OIDC session yet / first leg
-// of the OIDC redirect dance).
-func extractAuthHeader(req *authv3.CheckRequest) string {
-	// Try the Authorization header first.
-	if h := req.GetAttributes().GetRequest().GetHttp().GetHeaders()["authorization"]; strings.HasPrefix(h, "Bearer ") {
-		return h
-	}
-
-	// Fall back to Envoy oauth2 filter metadata.
-	// GetFilterMetadata() returns nil when there is no metadata — all Get* calls
-	// are nil-safe on protobuf generated types.
-	filterMeta := req.GetAttributes().GetMetadataContext().GetFilterMetadata()
-	if filterMeta == nil {
-		return ""
-	}
-	oauthStruct, ok := filterMeta["envoy.filters.http.oauth2"]
-	if !ok || oauthStruct == nil {
-		return ""
-	}
-	fields := oauthStruct.GetFields()
-	if fields == nil {
-		return ""
-	}
-	tokenVal, ok := fields["access_token"]
-	if !ok || tokenVal == nil {
-		return ""
-	}
-	if token := tokenVal.GetStringValue(); token != "" {
-		return "Bearer " + token
-	}
-	return ""
-}
-
-// authSource returns a short string identifying where the auth token came from,
-// for debug logging.
-func authSource(req *authv3.CheckRequest) string {
-	if h := req.GetAttributes().GetRequest().GetHttp().GetHeaders()["authorization"]; strings.HasPrefix(h, "Bearer ") {
-		return "authorization_header"
-	}
-	filterMeta := req.GetAttributes().GetMetadataContext().GetFilterMetadata()
-	if filterMeta != nil {
-		if oauthStruct, ok := filterMeta["envoy.filters.http.oauth2"]; ok && oauthStruct != nil {
-			if fields := oauthStruct.GetFields(); fields != nil {
-				if v, ok := fields["access_token"]; ok && v.GetStringValue() != "" {
-					return "oauth2_filter_metadata"
-				}
-			}
+// firstNonEmpty returns the first non-empty string from vals.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
 		}
 	}
-	return "none"
+	return ""
 }

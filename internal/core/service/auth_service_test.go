@@ -13,15 +13,6 @@ import (
 
 // ─── Mocks ────────────────────────────────────────────────────────────────────
 
-type mockDecoder struct {
-	identity *domain.Identity
-	err      error
-}
-
-func (m *mockDecoder) Decode(_ context.Context, _, _ string) (*domain.Identity, error) {
-	return m.identity, m.err
-}
-
 type mockUserRepo struct {
 	user *domain.User
 	err  error
@@ -50,27 +41,23 @@ func (m *mockSessionStore) Create(_ context.Context, _ string) (*domain.Session,
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-func newTestService(dec *mockDecoder, users *mockUserRepo, sess *mockSessionStore) *AuthService {
+func newTestService(users *mockUserRepo, sess *mockSessionStore) *AuthService {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
-	return New(dec, users, sess, logger)
+	return New(users, sess, logger)
 }
 
 const (
 	ghostSessionCookie = "ghost-admin-api-session=s:abc.xyz"
-	idTokenCookie      = "IdToken-abc123=eyJhbGciOiJSUzI1NiJ9.eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJzdWIiOiIxMjM0In0.sig"
+	testEmail          = "user@example.com"
+	noCookie           = "other=val"
 )
 
 // ─── Test: fast-path (ghost session already present) ──────────────────────────
 
 func TestEnsureSession_FastPath(t *testing.T) {
-	svc := newTestService(
-		&mockDecoder{err: errors.New("should not be called")},
-		&mockUserRepo{},
-		&mockSessionStore{},
-	)
+	svc := newTestService(&mockUserRepo{}, &mockSessionStore{})
 
-	cookieVal := ghostSessionCookie + "; other=stuff"
-	got, err := svc.EnsureSession(context.Background(), cookieVal, "")
+	got, err := svc.EnsureSession(context.Background(), ghostSessionCookie+"; other=stuff", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -79,18 +66,17 @@ func TestEnsureSession_FastPath(t *testing.T) {
 	}
 }
 
-// ─── Test: no token cookie ────────────────────────────────────────────────────
+// ─── Test: empty email → unauthorized ────────────────────────────────────────
 
-func TestEnsureSession_NoToken(t *testing.T) {
+func TestEnsureSession_EmptyEmail(t *testing.T) {
 	svc := newTestService(
-		&mockDecoder{err: domain.ErrNoToken},
-		&mockUserRepo{},
+		&mockUserRepo{err: domain.ErrUserNotFound},
 		&mockSessionStore{},
 	)
 
-	_, err := svc.EnsureSession(context.Background(), "other=val", "")
-	if !errors.Is(err, domain.ErrNoToken) {
-		t.Fatalf("expected ErrNoToken, got %v", err)
+	_, err := svc.EnsureSession(context.Background(), noCookie, "")
+	if !errors.Is(err, domain.ErrUnauthorized) {
+		t.Fatalf("expected ErrUnauthorized for empty email, got %v", err)
 	}
 }
 
@@ -98,12 +84,11 @@ func TestEnsureSession_NoToken(t *testing.T) {
 
 func TestEnsureSession_UserNotFound(t *testing.T) {
 	svc := newTestService(
-		&mockDecoder{identity: &domain.Identity{Email: "unknown@example.com"}},
 		&mockUserRepo{err: domain.ErrUserNotFound},
 		&mockSessionStore{},
 	)
 
-	_, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
+	_, err := svc.EnsureSession(context.Background(), noCookie, "unknown@example.com")
 	if !errors.Is(err, domain.ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
 	}
@@ -113,12 +98,11 @@ func TestEnsureSession_UserNotFound(t *testing.T) {
 
 func TestEnsureSession_UserInactive(t *testing.T) {
 	svc := newTestService(
-		&mockDecoder{identity: &domain.Identity{Email: "user@example.com"}},
-		&mockUserRepo{user: &domain.User{ID: "abc", Email: "user@example.com", Status: "suspended"}},
+		&mockUserRepo{user: &domain.User{ID: "abc", Email: testEmail, Status: "suspended"}},
 		&mockSessionStore{},
 	)
 
-	_, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
+	_, err := svc.EnsureSession(context.Background(), noCookie, testEmail)
 	if !errors.Is(err, domain.ErrUnauthorized) {
 		t.Fatalf("expected ErrUnauthorized, got %v", err)
 	}
@@ -135,12 +119,11 @@ func TestEnsureSession_ReuseExisting(t *testing.T) {
 	}
 	store := &mockSessionStore{existing: existingSession}
 	svc := newTestService(
-		&mockDecoder{identity: &domain.Identity{Email: "user@example.com"}},
-		&mockUserRepo{user: &domain.User{ID: "user001", Email: "user@example.com", Status: "active"}},
+		&mockUserRepo{user: &domain.User{ID: "user001", Email: testEmail, Status: "active"}},
 		store,
 	)
 
-	got, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
+	got, err := svc.EnsureSession(context.Background(), noCookie, testEmail)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -163,12 +146,11 @@ func TestEnsureSession_CreateNew(t *testing.T) {
 	}
 	store := &mockSessionStore{existing: nil, created: newSession}
 	svc := newTestService(
-		&mockDecoder{identity: &domain.Identity{Email: "user@example.com"}},
-		&mockUserRepo{user: &domain.User{ID: "user001", Email: "user@example.com", Status: "active"}},
+		&mockUserRepo{user: &domain.User{ID: "user001", Email: testEmail, Status: "active"}},
 		store,
 	)
 
-	got, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
+	got, err := svc.EnsureSession(context.Background(), noCookie, testEmail)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -186,12 +168,11 @@ func TestEnsureSession_CreateError(t *testing.T) {
 	dbErr := errors.New("db connection lost")
 	store := &mockSessionStore{existing: nil, createErr: dbErr}
 	svc := newTestService(
-		&mockDecoder{identity: &domain.Identity{Email: "user@example.com"}},
-		&mockUserRepo{user: &domain.User{ID: "user001", Email: "user@example.com", Status: "active"}},
+		&mockUserRepo{user: &domain.User{ID: "user001", Email: testEmail, Status: "active"}},
 		store,
 	)
 
-	_, err := svc.EnsureSession(context.Background(), idTokenCookie, "")
+	_, err := svc.EnsureSession(context.Background(), noCookie, testEmail)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

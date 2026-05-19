@@ -13,10 +13,10 @@ import (
 
 const ghostSessionCookieName = "ghost-admin-api-session"
 
-// AuthService implements primary.AuthService. It orchestrates the three secondary
-// ports: decode the OIDC token → verify staff membership → ensure a session exists.
+// AuthService implements primary.AuthService. It orchestrates the two secondary
+// ports: verify staff membership → ensure a session exists.
+// Identity resolution (email) is handled upstream by the ExtAuth adapter.
 type AuthService struct {
-	decoder  secondary.TokenDecoder
 	users    secondary.UserRepository
 	sessions secondary.SessionStore
 	logger   *slog.Logger
@@ -24,13 +24,11 @@ type AuthService struct {
 
 // New constructs an AuthService wired with the provided adapters.
 func New(
-	decoder secondary.TokenDecoder,
 	users secondary.UserRepository,
 	sessions secondary.SessionStore,
 	logger *slog.Logger,
 ) *AuthService {
 	return &AuthService{
-		decoder:  decoder,
 		users:    users,
 		sessions: sessions,
 		logger:   logger,
@@ -38,31 +36,21 @@ func New(
 }
 
 // EnsureSession implements primary.AuthService.
-func (s *AuthService) EnsureSession(ctx context.Context, cookieHeader, authHeader string) (string, error) {
+func (s *AuthService) EnsureSession(ctx context.Context, cookieHeader, email string) (string, error) {
 	// Fast path: ghost session cookie already present, nothing to do.
 	if hasGhostSessionCookie(cookieHeader) {
 		s.logger.DebugContext(ctx, "ghost-admin-api-session cookie present, passing through")
 		return "", nil
 	}
 
-	// Decode OIDC identity.
-	// Envoy Gateway encrypts IdToken-* cookies; the decrypted access token is
-	// forwarded as "Authorization: Bearer <jwt>" when forwardAccessToken=true in
-	// the SecurityPolicy. We pass both so the decoder can try Bearer first and
-	// fall back to the cookie path for local dev / testing.
-	identity, err := s.decoder.Decode(ctx, cookieHeader, authHeader)
-	if err != nil {
-		return "", fmt.Errorf("oidc token decode: %w", err)
-	}
-
 	s.logger.InfoContext(ctx, "no ghost session cookie found, verifying staff membership",
-		slog.String("email", identity.Email))
+		slog.String("email", email))
 
 	// Verify the identity maps to an active Ghost staff user.
-	user, err := s.users.FindByEmail(ctx, identity.Email)
+	user, err := s.users.FindByEmail(ctx, email)
 	if err != nil {
 		if errors.Is(err, domain.ErrUserNotFound) {
-			return "", fmt.Errorf("%w: %s", domain.ErrUnauthorized, identity.Email)
+			return "", fmt.Errorf("%w: %s", domain.ErrUnauthorized, email)
 		}
 		return "", fmt.Errorf("user repository: %w", err)
 	}
@@ -95,7 +83,7 @@ func (s *AuthService) EnsureSession(ctx context.Context, cookieHeader, authHeade
 
 	s.logger.InfoContext(ctx, "created ghost admin session",
 		slog.String("user_id", user.ID),
-		slog.String("email", identity.Email))
+		slog.String("email", email))
 	s.logger.DebugContext(ctx, "signed cookie for manual browser test",
 		slog.String("cookie_value", session.SignedCookieValue))
 

@@ -14,10 +14,20 @@ func setEnv(t *testing.T, pairs ...string) {
 	}
 }
 
+// requiredEnv sets the minimum required env vars so Load() does not panic.
+func requiredEnv(t *testing.T) {
+	t.Helper()
+	setEnv(t,
+		"DB_USER", "ghost",
+		"DB_PASSWORD", "ghostpass",
+		"AUTHENTIK_FORWARD_AUTH_URL", "https://auth.example.com/outpost.goauthentik.io/auth/application/ghost-admin/",
+	)
+}
+
 // ─── Load ─────────────────────────────────────────────────────────────────────
 
 func TestLoad_Defaults(t *testing.T) {
-	setEnv(t, "DB_USER", "ghost", "DB_PASSWORD", "ghostpass")
+	requiredEnv(t)
 
 	cfg, err := Load()
 	if err != nil {
@@ -39,6 +49,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel default: got %q", cfg.LogLevel)
 	}
+	if cfg.SessionMaxAgeDays != 30 {
+		t.Errorf("SessionMaxAgeDays default: got %d, want 30", cfg.SessionMaxAgeDays)
+	}
 }
 
 func TestLoad_EnvOverrides(t *testing.T) {
@@ -50,6 +63,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 		"DB_PASSWORD", "mypass",
 		"GRPC_PORT", "9090",
 		"LOG_LEVEL", "debug",
+		"SESSION_MAX_AGE_DAYS", "14",
+		"AUTHENTIK_FORWARD_AUTH_URL", "https://auth.example.com/outpost.goauthentik.io/auth/application/ghost-admin/",
 	)
 
 	cfg, err := Load()
@@ -78,10 +93,17 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	if cfg.LogLevel != "debug" {
 		t.Errorf("LogLevel: got %q, want debug", cfg.LogLevel)
 	}
+	if cfg.SessionMaxAgeDays != 14 {
+		t.Errorf("SessionMaxAgeDays: got %d, want 14", cfg.SessionMaxAgeDays)
+	}
+	if cfg.AuthentikForwardAuthURL != "https://auth.example.com/outpost.goauthentik.io/auth/application/ghost-admin/" {
+		t.Errorf("AuthentikForwardAuthURL: got %q", cfg.AuthentikForwardAuthURL)
+	}
 }
 
 func TestLoad_InvalidDBPort(t *testing.T) {
-	setEnv(t, "DB_USER", "ghost", "DB_PASSWORD", "ghostpass", "DB_PORT", "not-a-number")
+	requiredEnv(t)
+	t.Setenv("DB_PORT", "not-a-number")
 
 	_, err := Load()
 	if err == nil {
@@ -93,7 +115,8 @@ func TestLoad_InvalidDBPort(t *testing.T) {
 }
 
 func TestLoad_InvalidGRPCPort(t *testing.T) {
-	setEnv(t, "DB_USER", "ghost", "DB_PASSWORD", "ghostpass", "GRPC_PORT", "bad")
+	requiredEnv(t)
+	t.Setenv("GRPC_PORT", "bad")
 
 	_, err := Load()
 	if err == nil {
@@ -102,6 +125,23 @@ func TestLoad_InvalidGRPCPort(t *testing.T) {
 	if !strings.Contains(err.Error(), "GRPC_PORT") {
 		t.Fatalf("error should mention GRPC_PORT: %v", err)
 	}
+}
+
+func TestLoad_AuthentikForwardAuthURL_Required(t *testing.T) {
+	// Do NOT set AUTHENTIK_FORWARD_AUTH_URL — Load must panic.
+	setEnv(t, "DB_USER", "ghost", "DB_PASSWORD", "ghostpass")
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic when AUTHENTIK_FORWARD_AUTH_URL is unset")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "AUTHENTIK_FORWARD_AUTH_URL") {
+			t.Fatalf("panic message should mention AUTHENTIK_FORWARD_AUTH_URL, got: %v", r)
+		}
+	}()
+	Load() //nolint:errcheck // we expect a panic before Load returns
 }
 
 // mustEnv panics when the var is missing — test that via a recover.

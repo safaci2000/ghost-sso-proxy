@@ -5,7 +5,6 @@ go 1.26
 require (
 	github.com/envoyproxy/go-control-plane/envoy v1.37.0
 	github.com/go-sql-driver/mysql v1.10.0
-	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/joho/godotenv v1.5.1
 	github.com/magefile/mage v1.17.2
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260511170946-3700d4141b60

@@ -1,26 +1,22 @@
 # Ghost SSO: ExtAuth Architecture and Implementation Notes
 
-This document describes the current (working) architecture of `ghost-sso-proxy`, the problems
-encountered along the way, and the design decisions that resolved them. The other docs in this
-directory (`architecture.md`, `envoy-wiring.md`, `kubernetes-deployment.md`) describe the original
-ExtProc design, which was retired. Treat this document as the authoritative reference.
+This document is the authoritative reference for `ghost-sso-proxy`. It describes the current architecture (Envoy ExtAuth + Authentik forward auth), the design decisions behind it, and everything an operator needs to run and debug the system.
 
 ---
 
-## Background: why ExtProc was replaced
+## Background: how we got here
 
-The original design used Envoy's External Processor (`EnvoyExtensionPolicy` → `extProc`). In
-principle, ExtProc is powerful: Envoy streams request and response headers to the sidecar, and the
-sidecar can mutate them or issue an `ImmediateResponse`. In practice, the Envoy Gateway controller
-accepted the `EnvoyExtensionPolicy` with `status: Accepted: True`, but never programmed an
-`ext_proc` filter into the Envoy data plane. A live `config_dump` of the Envoy proxy pod confirmed
-zero `ext_proc` filter entries. The root cause is suspected to be a translation bug in the
-`EnvoyExtensionPolicy → xDS` path in the version of Envoy Gateway in use.
+### ExtProc → ExtAuth
 
-The replacement is External Authorization (`SecurityPolicy` → `extAuth`). ExtAuth uses a much
-simpler protocol: a single unary `Check` RPC per request (no bidirectional streaming), and the
-`SecurityPolicy` code path in Envoy Gateway is far more battle-tested because it is the same path
-used for the OIDC filter.
+The original design used Envoy's External Processor (`EnvoyExtensionPolicy` → `extProc`). The Envoy Gateway controller accepted the policy but never programmed an `ext_proc` filter into the data plane — a confirmed translation bug in the version in use. We replaced it with External Authorization (`SecurityPolicy` → `extAuth`), which uses a simpler unary `Check` RPC and is far more battle-tested in Envoy Gateway.
+
+### oauth2 filter → Authentik forward auth
+
+The first ExtAuth iteration used Envoy's built-in `oidc:` SecurityPolicy block to handle the Authentik login flow, then forwarded the decrypted access token to the shim as `Authorization: Bearer <token>`. The shim called Authentik's userinfo endpoint to resolve the email.
+
+This required an `EnvoyPatchPolicy` to move the oauth2 filter before ext_authz in the HTTP filter chain. The patch used hardcoded filter-chain indices. When a new HTTPRoute was added to the cluster (Mastodon), the indices shifted, Envoy crash-looped, and the entire gateway went down.
+
+The fix is the current design: remove the oauth2 filter entirely. The shim calls Authentik's **forward auth endpoint** directly, forwarding the browser's cookie header. Authentik validates its own proxy session cookie and returns the user's email — or a redirect URL if the user needs to log in. No filter ordering to manage, no `EnvoyPatchPolicy` needed.
 
 ---
 
@@ -31,31 +27,35 @@ Browser
   │
   ▼
 Envoy Gateway (http-gateway)
-  │  HTTPS listener — two filters in this order after the fix:
-  │    [0] envoy.filters.http.oauth2      ← decrypts AccessToken-* cookie,
-  │                                          injects Authorization: Bearer <jwt>
-  │    [1] envoy.filters.http.ext_authz   ← calls ghost-auth-shim (ExtAuth)
-  │    [2] envoy.filters.http.router
+  │  HTTPS listener — single filter chain (no oauth2 filter):
+  │    [0] envoy.filters.http.ext_authz   ← calls ghost-auth-shim (ExtAuth)
+  │    [1] envoy.filters.http.router
   │
   ├─── SecurityPolicy (ghost-oidc)
-  │      OIDC: Authentik provider, forwardAccessToken: true
-  │      extAuth: ghost-auth-shim:8080 (gRPC)
+  │      extAuth only: ghost-auth-shim:8080 (gRPC)
+  │      (no oidc: block — Authentik handles auth via forward auth)
   │
   ▼
 ghost-auth-shim (ghost-sso-proxy, this repo)
   │  implements envoy.service.auth.v3.Authorization
   │
   ├── Fast path: ghost-admin-api-session cookie already present
-  │     → OkResponse (strip Authorization header so Bearer never reaches Ghost)
+  │     → OkResponse immediately (no network calls)
   │
-  └── Slow path: no session cookie
-        1. Extract Authorization: Bearer <access_token> from request headers
-        2. Call OIDC userinfo endpoint → resolve email
-        3. SELECT users WHERE email = ? → confirm active staff member
-        4. SELECT sessions WHERE user_id = ? → reuse existing row (refresh session_data)
+  └── Slow path: no ghost session cookie
+        1. Call Authentik forward auth endpoint (HTTP GET)
+           forwarding browser Cookie, X-Forwarded-Host/Proto/Uri
+           ├── 200 + X-Authentik-Email: user@example.com
+           │     → proceed to step 2
+           └── 302 + Location: https://auth.esamir.com/application/o/authorize/?...
+                   + Set-Cookie: authentik_proxy_*=<pkce-state>
+                 → DeniedResponse 302 to that Location, forwarding Set-Cookie headers
+                   (PKCE state cookies must reach the browser or the callback fails)
+        2. SELECT users WHERE email = ? → confirm active staff member
+        3. SELECT sessions WHERE user_id = ? → reuse existing row
            OR INSERT new session row
-        5. Sign cookie: s:<session_id>.<base64(HMAC-SHA256(session_id, admin_session_secret))>
-        6. DeniedResponse 302 → Location: /ghost/, Set-Cookie: ghost-admin-api-session=...
+        4. Sign cookie: s:<session_id>.<base64(HMAC-SHA256(session_id, admin_session_secret))>
+        5. DeniedResponse 302 → Location: /ghost/, Set-Cookie: ghost-admin-api-session=...
 
   ▼
 Ghost CMS (port 80, internal)
@@ -70,123 +70,39 @@ Ghost CMS (port 80, internal)
 ### First visit (no session cookie)
 
 1. Browser requests `https://blog.esamir.com/ghost/`.
-2. Envoy's `oauth2` filter sees no `AccessToken-*` cookie → redirects to Authentik.
-3. User authenticates with Authentik. Authentik redirects back to `/oauth2/callback`.
-4. Envoy's `oauth2` filter completes the code exchange, stores the encrypted access token in an
-   `AccessToken-*` cookie, and redirects the browser to `/ghost/`.
-5. Browser requests `/ghost/` again — now carrying the `AccessToken-*` cookie.
-6. Envoy's `oauth2` filter decrypts the cookie and injects `Authorization: Bearer <access_token>`
-   into the request headers.
-7. Envoy calls `ghost-auth-shim.Check` (ExtAuth). No `ghost-admin-api-session` cookie is present,
-   so the slow path runs:
-   - The service calls the Authentik userinfo endpoint with the Bearer token → resolves `email`.
-   - Looks up the user in Ghost's MariaDB; confirms `status = "active"`.
-   - Finds or creates a session row; signs the cookie.
-   - Returns `DeniedResponse` 302 with `Set-Cookie: ghost-admin-api-session=s:<id>.<sig>`.
-8. Browser receives the 302, stores the cookie, follows redirect to `/ghost/`.
+2. Envoy calls `ghost-auth-shim.Check` (ExtAuth). No `ghost-admin-api-session` cookie is present, so the slow path runs.
+3. The shim calls `GET https://auth.esamir.com/outpost.goauthentik.io/auth/traefik` with the browser's Cookie header and `X-Forwarded-*` headers forwarded.
+4. If no Authentik session exists: Authentik returns **302** + `Location: https://auth.esamir.com/application/o/authorize/?...` + `Set-Cookie: authentik_proxy_*=<pkce-state>`. The shim returns `DeniedResponse 302` to that URL, forwarding the `authentik_proxy_*` cookie so the browser can store the PKCE state token.
+5. The browser authenticates with Authentik. After login, Authentik redirects to `https://blog.esamir.com/outpost.goauthentik.io/callback` — handled by the `ghost-authentik-callback` HTTPRoute (routes to `authentik-server`, no SecurityPolicy). The proxyv2 completes the code exchange and redirects back to the original URL with an Authentik session cookie.
+6. Browser requests `/ghost/` again — now carrying the Authentik session cookie.
+7. The shim calls Authentik forward auth again. Authentik returns **200** + `X-Authentik-Email: user@example.com`.
+8. The shim looks up the user in Ghost's MariaDB, confirms `status = "active"`, finds or creates a session row, signs the cookie.
+9. Returns `DeniedResponse 302` with `Set-Cookie: ghost-admin-api-session=s:<id>.<sig>; Path=/ghost; HttpOnly; Secure; SameSite=None`.
+10. Browser stores the cookie, follows redirect to `/ghost/`.
 
-### Subsequent visits (session cookie present)
+### Subsequent visits (both session cookies present)
 
-1. Browser requests any `/ghost/*` URL, sending `ghost-admin-api-session=s:<id>.<sig>`.
-2. Envoy calls `ghost-auth-shim.Check`. The fast path fires immediately — no DB or userinfo
-   call. The `Authorization: Bearer` header is stripped from the request so it never reaches Ghost.
-3. Ghost receives the request with the session cookie, verifies the HMAC signature against
-   `admin_session_secret`, reads `session_data.user_id`, loads the user → serves the admin panel.
+1. Browser requests any `/ghost/*` URL, sending both `authentik_session` and `ghost-admin-api-session`.
+2. Envoy calls `ghost-auth-shim.Check`. The fast path fires immediately — cookie present, `OkResponse` returned.
+3. No Authentik call. No DB hit. Ghost receives the request with the session cookie, verifies the HMAC, serves the admin panel.
 
----
+### Ghost session expired (Authentik session still valid)
 
-## Critical: Envoy filter chain ordering
-
-### The problem
-
-By default, Envoy Gateway places `ext_authz` at index `[0]` and `oauth2` at index `[1]`:
-
-```
-[0] envoy.filters.http.ext_authz   ← fires first — access token not yet decrypted
-[1] envoy.filters.http.oauth2      ← fires second — too late
-[2] envoy.filters.http.router
-```
-
-Because `ext_authz` runs before `oauth2` decrypts the `AccessToken-*` cookie, the `Check` request
-arrives at `ghost-auth-shim` with no `Authorization: Bearer` header. The service can find no token
-and fails open — every request fast-paths to Ghost unauthenticated.
-
-### The fix: EnvoyPatchPolicy
-
-An `EnvoyPatchPolicy` (JSON Patch `move`) swaps the two filters so `oauth2` runs first:
-
-```yaml
-# apps/ghost/overlays/default/home/envoy-patch.yaml
-apiVersion: gateway.envoyproxy.io/v1alpha1
-kind: EnvoyPatchPolicy
-metadata:
-  name: oauth2-before-extauthz
-  namespace: default          # must be the same namespace as the Gateway
-spec:
-  targetRef:
-    group: gateway.networking.k8s.io
-    kind: Gateway
-    name: http-gateway
-  type: JSONPatch
-  jsonPatches:
-    - type: "type.googleapis.com/envoy.config.listener.v3.Listener"
-      name: "default/http-gateway/https"
-      operation:
-        op: move
-        from: "/filter_chains/0/filters/0/typed_config/http_filters/1"
-        path: "/filter_chains/0/filters/0/typed_config/http_filters/0"
-```
-
-The indices (`/filter_chains/0/filters/0/…/1` and `…/0`) were confirmed against a live Envoy
-`config_dump`. If the `SecurityPolicy` or `Gateway` is changed and the indices shift, re-run the
-`apply-extauth-metadata-patch.sh` script to discover the new positions and update the patch.
-
-### Enabling EnvoyPatchPolicy
-
-`EnvoyPatchPolicy` is disabled in Envoy Gateway by default. It must be explicitly enabled in the
-Envoy Gateway Helm values:
-
-```yaml
-# apps/envoy-gateway/base/values.yml
-config:
-  envoyGateway:
-    apiVersion: gateway.envoyproxy.io/v1alpha1
-    kind: EnvoyGateway
-    extensionApis:
-      enableEnvoyPatchPolicy: true
-```
-
-Without this, the policy is silently ignored and shows `reason: Disabled` in its status. After
-enabling it, the status should show `reason: Programmed` / `Patches have been successfully applied`.
+1. Browser requests `/ghost/` with `authentik_session` but without (or with expired) `ghost-admin-api-session`.
+2. Slow path: shim calls Authentik forward auth → 200 + email (Authentik session is still valid, no login needed).
+3. Shim creates a new Ghost session silently, returns 302 + `Set-Cookie`.
+4. Browser stores the new cookie; user never sees a login prompt. Session renewal is fully transparent.
 
 ---
 
 ## Kubernetes configuration
 
-### SecurityPolicy (oidc.yaml)
+### SecurityPolicy (`oidc.yaml`)
 
-The `ghost-oidc` SecurityPolicy sits on the `ghost-admin` HTTPRoute. It configures two things in
-a single resource:
-
-- **OIDC** — handles authentication with Authentik, manages the `AccessToken-*` cookie, and
-  forwards the decrypted access token as `Authorization: Bearer <token>` to downstream filters.
-  `forwardAccessToken: true` is required; without it the Bearer header is never injected and
-  ExtAuth sees no token.
-- **extAuth** — wires `ghost-auth-shim` as the External Authorization backend.
+The `ghost-oidc` SecurityPolicy sits on the `ghost-admin` HTTPRoute. It now has a single job — wiring the ExtAuth backend:
 
 ```yaml
 spec:
-  oidc:
-    provider:
-      issuer: "https://auth.esamir.com/application/o/envoy-oidc/"
-    clientID: "..."
-    clientSecret:
-      name: ghost-oidc
-      namespace: ghost
-    redirectURL: "https://blog.esamir.com/oauth2/callback"
-    logoutPath: "/ghost/signout"
-    forwardAccessToken: true
-    scopes: [openid, profile, email]
   extAuth:
     grpc:
       backendRefs:
@@ -194,84 +110,94 @@ spec:
           port: 8080
 ```
 
-### auth-shim Deployment (auth-shim.yaml)
+The `oidc:` block has been removed. Authentik handles authentication internally via the forward auth endpoint; Envoy is no longer involved in the login flow.
+
+### HTTPRoute (`oidc.yaml`)
+
+The `ghost-admin` HTTPRoute matches only `/ghost`:
+
+```yaml
+rules:
+  - matches:
+      - path:
+          type: PathPrefix
+          value: /ghost
+    backendRefs:
+      - name: ghost
+        port: 80
+```
+
+The `/oauth2/callback` match was removed — it was only needed for Envoy's internal oauth2 token exchange, which is gone.
+
+### auth-shim Deployment (`auth-shim.yaml`)
 
 Key environment variables:
 
 | Variable | Purpose | Value |
 |---|---|---|
-| `GHOST_ADMIN_URL` | Internal Ghost URL (logged only, not currently used for requests) | `http://ghost.ghost.svc.cluster.local` |
 | `DB_HOST` | MariaDB host | `mariadb.mariadb.svc.cluster.local` |
 | `DB_NAME` | Database name | `ghost` |
 | `DB_USER` | Database user | `ghost` |
 | `DB_PASSWORD` | Database password (from Secret) | — |
-| `LOG_LEVEL` | Verbosity | `debug` (set to `info` in production) |
-| `SESSION_MAX_AGE_DAYS` | Session lifetime | `180` |
-| `OIDC_USERINFO_URL` | Authentik userinfo endpoint | `https://auth.esamir.com/application/o/userinfo/` |
+| `LOG_LEVEL` | Verbosity | `info` (use `debug` to see per-request decisions) |
+| `SESSION_MAX_AGE_DAYS` | Ghost session lifetime | `30` |
+| `AUTHENTIK_FORWARD_AUTH_URL` | Authentik forward auth endpoint (required) | `https://auth.esamir.com/outpost.goauthentik.io/auth/traefik` |
 
-The `OIDC_USERINFO_URL` must match the `userinfo_endpoint` field in the provider's
-`.well-known/openid-configuration` — **not** the application-specific userinfo path. Confirm with:
+`AUTHENTIK_FORWARD_AUTH_URL` is required. The service panics at startup if it is not set. Use the `/auth/traefik` path — the per-application path (`/auth/application/<slug>/`) was removed in Authentik 2026.x.
 
-```bash
-curl https://auth.esamir.com/application/o/envoy-oidc/.well-known/openid-configuration \
-  | python3 -m json.tool | grep userinfo
-```
+Ghost session lifetime (`SESSION_MAX_AGE_DAYS`) can be short (30 days) because Authentik's proxy session (365 days) transparently re-creates Ghost sessions when they expire. Users are never prompted to log in again.
 
 ---
 
 ## Go service implementation
 
-### Token decoding via OIDC userinfo (oidctoken/decoder.go)
+### Authentik forward auth client (`authentik/forward_auth.go`)
 
-The access token forwarded by Envoy's `oauth2` filter is an opaque token (Authentik issues opaque
-access tokens by default). It cannot be decoded locally as a JWT. Instead, the decoder calls the
-OIDC userinfo endpoint with the Bearer token to resolve the email claim:
+Implements the `secondary.ForwardAuthChecker` port. Makes a single HTTP GET to the forward auth endpoint with:
+
+- `Cookie: <browser cookie header>` — forwards the browser's full cookie header so Authentik can find its `authentik_session` cookie
+- `X-Forwarded-Host: blog.esamir.com`
+- `X-Forwarded-Proto: https`
+- `X-Forwarded-Uri: /ghost/` (the original request URI)
+
+The HTTP client has `CheckRedirect` set to return `ErrUseLastResponse` — it does **not** follow redirects. A 302 is a valid response meaning "not authenticated"; the shim extracts the `Location` header and passes it to the browser.
+
+Returns:
+- `(email, "", nil, nil)` — authenticated
+- `("", redirectURL, setCookies, nil)` — not authenticated; `setCookies` contains any `authentik_proxy_*` PKCE state cookies from Authentik's 302 response that must be forwarded to the browser
+- `("", "", nil, err)` — network/protocol error; caller fails open
+
+### ExtAuth Check RPC (`extauth/server.go`)
 
 ```
-Authorization: Bearer <access_token>
-GET https://auth.esamir.com/application/o/userinfo/
-→ {"sub": "...", "email": "user@example.com", ...}
+Check(ctx, req):
+  1. Extract cookie header, :authority/:host, :scheme/X-Forwarded-Proto, :path
+  2. If ghost-admin-api-session present → OkResponse (fast path)
+  3. Call authentik.Check(ctx, cookieHeader, host, proto, uri)
+     ├── redirectURL != "" → DeniedResponse 302 to redirectURL
+     │                       forwarding any authentik_proxy_* Set-Cookie headers
+     │                       (PKCE state — required for the OAuth2 callback)
+     ├── err != nil        → OkResponse (fail-open)
+     └── email != ""       → auth.EnsureSession(ctx, cookieHeader, email)
+           ├── "" (fast path again) → OkResponse
+           └── signedCookie        → DeniedResponse 302 /ghost/ + Set-Cookie
 ```
 
-When `OIDC_USERINFO_URL` is empty (local dev), the decoder falls back to treating the access token
-as a JWT and decoding its payload directly — no signature verification (Envoy already did that).
+Two distinct redirect builders:
+- `deniedRedirectTo(url, setCookies)` — 302 with Location + any Authentik PKCE state cookies forwarded as Set-Cookie headers. Used for Authentik login redirects.
+- `deniedRedirectWithCookie(path, cookie)` — 302 to `/ghost/` with the Ghost session Set-Cookie. Used for Ghost session injection.
 
-### ExtAuth Check RPC (extauth/server.go)
+### Session management (`mariadb/session_store.go`)
 
-The `Check` method:
+#### Reading `admin_session_secret`
 
-1. Reads `cookie` and `authorization` headers from `req.GetAttributes().GetRequest().GetHttp().GetHeaders()`.
-2. Calls `auth.EnsureSession(ctx, cookieHeader, authHeader)`.
-3. **Fast path** (`signedCookie == ""`): returns `OkResponse`, stripping the `Authorization` header
-   so the Bearer token never leaks to Ghost.
-4. **Slow path** (cookie returned): returns `DeniedResponse` 302 with `Set-Cookie`.
-5. **Error path**: returns `OkResponse` (fail-open). Ghost renders its own login page as a
-   safe fallback; requests are never hard-blocked.
-
-Why `DeniedResponse` for the cookie redirect, not `OkResponse` with a header mutation: Envoy
-Gateway strips `Set-Cookie` from `OkResponse` header mutations. A `DeniedResponse` (302) bypasses
-the response-filter chain entirely, so `Set-Cookie` reaches the browser unmodified.
-
-The `authorization` header fallback in `extractAuthHeader` also checks
-`metadata_context["envoy.filters.http.oauth2"]["access_token"]` for environments where Envoy
-writes the access token into filter metadata rather than request headers. In the current deployment,
-the header path works (confirmed by `auth_source: authorization_header` in logs).
-
-### Session management (mariadb/session_store.go)
-
-#### Reading admin_session_secret
-
-Ghost's express-session signs cookies with the value of the `admin_session_secret` key in the
-`settings` table. The store reads this once at startup:
+The store reads this once at startup:
 
 ```sql
 SELECT `value` FROM `settings` WHERE `key` = 'admin_session_secret' LIMIT 1
 ```
 
-The value may or may not be JSON-encoded (i.e., stored with surrounding `"` quotes in the DB). The
-startup code attempts a JSON-decode and falls back to the raw string if the decode fails. The
-startup log records `json_decoded`, `raw_len`, `final_len`, `raw_head`, and `raw_tail` so you can
-cross-check the value without leaking it.
+The value may be JSON-encoded (surrounded by `"` quotes in the DB). The startup code attempts a JSON-decode and falls back to the raw string. Startup logs record `json_decoded`, `raw_len`, `final_len`, `raw_head`, and `raw_tail` so you can cross-check the value without leaking it.
 
 #### Cookie signing
 
@@ -281,33 +207,25 @@ Replicates `cookie-signature.sign()` from Node.js exactly:
 s:<session_id>.<base64_std(HMAC-SHA256(session_id, admin_session_secret)).trimRight("=")>
 ```
 
-Both Go and Node.js use standard (not URL-safe) base64 for the signature. The session ID itself is
-URL-safe base64 (32 chars from 24 random bytes, matching uid-safe's output).
+Both Go and Node.js use standard (not URL-safe) base64 for the signature. The session ID itself is URL-safe base64 (32 chars from 24 random bytes, matching uid-safe's output).
 
 #### Finding and refreshing sessions
 
-`FindByUserID` returns the most recent session created within the `SESSION_MAX_AGE_DAYS` window.
-When a session is found it immediately refreshes the row:
+`FindByUserID` returns the most recent session created within the `SESSION_MAX_AGE_DAYS` window. When found it immediately refreshes the row:
 
 ```sql
 UPDATE sessions SET session_data = ?, updated_at = ? WHERE session_id = ?
 ```
 
-This is intentional. Older rows may have been written before `verified: true` was added to the
-`session_data` schema. Ghost 6.x checks `session_data.verified === true` and returns 403 if the
-field is missing or false. Refreshing the data on every reuse ensures the row is always valid
-regardless of when or how it was originally created, and also bumps `updated_at` in the same way
-Ghost's own express-session middleware would.
+This ensures the `session_data` JSON is always current (Ghost 6.x requires `verified: true`) and bumps `updated_at` the same way Ghost's own express-session middleware would.
 
-#### session_data schema
-
-The JSON blob written to the `session_data` column must match Ghost's internal schema exactly:
+#### `session_data` schema
 
 ```json
 {
   "cookie": {
-    "originalMaxAge": 15552000000,
-    "expires": "2026-11-13T23:28:01.011Z",
+    "originalMaxAge": 2592000000,
+    "expires": "2026-06-18T00:00:00.000Z",
     "secure": true,
     "httpOnly": true,
     "path": "/ghost",
@@ -321,40 +239,51 @@ The JSON blob written to the `session_data` column must match Ghost's internal s
 }
 ```
 
-`verified: true` is required. `origin`, `user_agent`, and `ip` are present in every Ghost-created
-row but are not validated on authorization; empty strings are fine.
-
-`sameSite` must be `"none"` (lowercase) — Ghost itself uses this value. `SameSite=None` requires
-`Secure=true`, which we always include.
-
-#### Creating new sessions
-
-If no session exists for the user, `Create` generates:
-
-- **Session ID**: 24 crypto-random bytes → 32-char URL-safe base64 (matches uid-safe).
-- **Object ID** (row `id`): 4-byte big-endian Unix timestamp + 8 random bytes → 24 hex chars
-  (matches Ghost's MongoDB-style primary keys).
+`verified: true` is required — Ghost 6.x returns 403 without it. `sameSite` must be `"none"` (lowercase). `SameSite=None` requires `Secure=true`, which is always included.
 
 ---
 
 ## Debugging
 
-### Useful log fields (LOG_LEVEL=debug)
+### Useful log fields (`LOG_LEVEL=debug`)
 
 | Log message | Meaning |
 |---|---|
-| `extauth check` | Fires on every request. Check `has_bearer_token`, `auth_source`, `has_cookie_header`. |
-| `ghost-admin-api-session cookie present, passing through` | Fast path hit — ExtAuth is not involved further. |
+| `extauth check` | Fires on every request. Check `has_ghost_cookie`. |
+| `ghost-admin-api-session cookie present, passing through` | Fast path — no further processing. |
 | `no ghost session cookie found, verifying staff membership` | Slow path starting; shows `email`. |
 | `reusing existing ghost session` | Existing DB row found for `user_id`; session_data refreshed. |
 | `created ghost admin session` | New session row inserted. |
-| `signed cookie for manual browser test` | Full `s:<id>.<sig>` value (debug level only). |
-| `auth service error, failing open` | Something went wrong; request passed through unauthenticated. |
+| `signed cookie for manual browser test` | Full `s:<id>.<sig>` value — paste into DevTools to test manually. |
+| `auth service error, failing open` | Error in the slow path; request passed through unauthenticated. |
+
+### Checking Authentik forward auth connectivity
+
+Test the endpoint from inside the cluster (the shim container may not have `wget`; use the Ghost container instead):
+
+```bash
+kubectl -n ghost exec deploy/ghost -- \
+  curl -sv \
+  -H "X-Forwarded-Host: blog.esamir.com" \
+  -H "X-Forwarded-Proto: https" \
+  -H "X-Forwarded-Uri: /ghost/" \
+  "https://auth.esamir.com/outpost.goauthentik.io/auth/traefik" 2>&1 | grep -E "< HTTP|< Location|< Set-Cookie"
+```
+
+Expected without a valid Authentik session:
+```
+< HTTP/1.1 302 Found
+< Location: https://auth.esamir.com/application/o/authorize/?...
+< Set-Cookie: authentik_proxy_...=...; Path=/; HttpOnly; Secure; SameSite=Lax
+```
+
+If you see `HTTP/1.1 404` instead of 302, verify that `AUTHENTIK_FORWARD_AUTH_URL` ends with `/auth/traefik` (not `/auth/application/<slug>/` — that path was removed in Authentik 2026.x).
+
+If you get a connection error, check that `auth.esamir.com` is reachable from the `ghost` namespace and that the URL in `AUTHENTIK_FORWARD_AUTH_URL` is correct.
 
 ### Manually verifying HMAC
 
-If Ghost returns 403 despite a valid-looking cookie, check that the signing secret matches what
-Ghost is using:
+If Ghost returns 403 despite a valid-looking cookie:
 
 ```bash
 # 1. Read the raw secret from MariaDB
@@ -363,7 +292,7 @@ kubectl -n mariadb exec -it deploy/mariadb -- mysql -u ghost -p ghost \
 
 # 2. Cross-check against the startup log (raw_head / raw_tail fields)
 
-# 3. Recompute the expected cookie value in Node.js:
+# 3. Recompute the expected cookie value
 node -e "
   const crypto = require('crypto');
   const sid = 'PASTE_SESSION_ID_FROM_LOGS';
@@ -371,19 +300,21 @@ node -e "
   const sig = crypto.createHmac('sha256', secret).update(sid).digest('base64').replace(/=+$/, '');
   console.log('s:' + sid + '.' + sig);
 "
-# Compare with the value in 'signed cookie for manual browser test' log.
 ```
+
+Compare with the `signed cookie for manual browser test` log line.
 
 ### Clearing a stuck session
 
-If the browser is stuck in a 403 loop (cookie present, Ghost rejecting it):
+If the browser is stuck in a 403 loop:
 
-1. Open DevTools → Application → Cookies → `blog.esamir.com`.
-2. Delete `ghost-admin-api-session`.
-3. Optionally delete `AccessToken-*` and `IdToken-*` cookies to force a fresh Authentik flow.
-4. Reload — the full auth cycle runs again, and `FindByUserID` will refresh the session_data.
+1. Open DevTools → Application → Cookies → `blog.esamir.com`
+2. Delete `ghost-admin-api-session`
+3. Reload — the slow path runs, creates a fresh session with current `session_data`
 
-### Verifying session_data in the DB
+Do **not** delete `authentik_session` unless you want to force a full re-login through Authentik.
+
+### Verifying `session_data` in the DB
 
 ```bash
 kubectl -n mariadb exec -it deploy/mariadb -- mysql -u ghost -p ghost \
@@ -394,25 +325,13 @@ kubectl -n mariadb exec -it deploy/mariadb -- mysql -u ghost -p ghost \
 
 Confirm `"verified":true` is present.
 
-### Checking EnvoyPatchPolicy status
-
-```bash
-kubectl get envoypatchpolicy -n default oauth2-before-extauthz -o yaml
-```
-
-The `.status.conditions` should show `reason: Programmed`. `reason: Disabled` means
-`enableEnvoyPatchPolicy: true` is not in the Envoy Gateway Helm values. `reason: Invalid` means
-the patch indices are wrong — re-run `apply-extauth-metadata-patch.sh` to find the correct ones.
-
 ### Inspecting the live filter chain
 
 ```bash
-# Find the Envoy proxy pod
 POD=$(kubectl -n envoy-gateway-system get pods \
   -l 'gateway.envoyproxy.io/owning-gateway-name=http-gateway' \
   -o jsonpath='{.items[0].metadata.name}')
 
-# Port-forward and dump the config
 kubectl -n envoy-gateway-system port-forward pod/$POD 19001:19000 &
 sleep 2
 curl -s http://localhost:19001/config_dump | python3 -c "
@@ -433,26 +352,19 @@ for c in cfg['configs']:
 "
 ```
 
-After the `EnvoyPatchPolicy` is applied you should see `oauth2` at index 0 and `ext_authz` at
-index 1.
+You should see `ext_authz` at index 0 and `router` at index 1. No `oauth2` filter. No `EnvoyPatchPolicy` is applied.
 
 ---
 
 ## What must not change
 
-The following are invariants that the whole chain depends on:
-
-- **`forwardAccessToken: true`** in the SecurityPolicy OIDC block. Without this, Envoy does not
-  inject the Bearer header and ExtAuth sees no token.
-- **`admin_session_secret`** in Ghost's `settings` table. This value is read once at proxy startup.
-  If Ghost rotates it (e.g. DB restore, re-install), restart the `ghost-auth-shim` pod.
-- **`enableEnvoyPatchPolicy: true`** in the Envoy Gateway Helm values. Without it the filter-order
-  patch is silently ignored.
-- **`EnvoyPatchPolicy` namespace `default`** — it must be in the same namespace as the `Gateway`
-  resource (`http-gateway` lives in `default`).
-- **`SESSION_MAX_AGE_DAYS`** — if changed, existing sessions that were created with a different max
-  age will have their `session_data.cookie.originalMaxAge` refreshed on next reuse, which is fine.
-  Do not change this to 0 or negative; the config validator will reject it.
+| Invariant | Why |
+|---|---|
+| `admin_session_secret` in Ghost's `settings` table | Read once at proxy startup. If Ghost rotates it (DB restore, re-install), restart `ghost-auth-shim`. |
+| `AUTHENTIK_FORWARD_AUTH_URL` ends with `/auth/traefik` | Wrong path → 404 from Authentik; shim fails open and users reach Ghost unauthenticated. The per-application path (`/auth/application/<slug>/`) was removed in Authentik 2026.x. |
+| `SESSION_MAX_AGE_DAYS` ≥ 1 | Config validator rejects 0 or negative. Changing this value is safe — `session_data` is refreshed on every session reuse. |
+| Authentik Proxy Provider mode = `forward_single` | `forward_domain` mode rewrites the `X-Forwarded-Host` header and breaks the routing. |
+| Authentik provider assigned to the embedded outpost | Without this, the forward auth endpoint returns 404. |
 
 ---
 
@@ -461,17 +373,18 @@ The following are invariants that the whole chain depends on:
 ```bash
 # 1. Go changes
 go test ./...
+go test -race ./...
 
 # 2. Build and push
 mage buildLinux
 docker build -t ghcr.io/safaci2000/ghost-sso-proxy:main-<sha> .
 docker push ghcr.io/safaci2000/ghost-sso-proxy:main-<sha>
 
-# 3. Update image tag
-#    Edit apps/ghost/overlays/default/home/auth-shim.yaml → image: ghcr.io/.../ghost-sso-proxy:main-<sha>
+# 3. Update image tag in auth-shim.yaml
+#    image: ghcr.io/safaci2000/ghost-sso-proxy:main-<sha>
 
-# 4. Commit both repos
-#    ArgoCD syncs automatically. The SecurityPolicy and new image roll out together.
+# 4. Commit both repos (ghost-sso-proxy + nas-flux)
+#    ArgoCD syncs automatically.
 
 # 5. Verify
 kubectl -n ghost rollout status deployment/ghost-auth-shim

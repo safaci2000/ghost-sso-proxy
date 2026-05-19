@@ -19,8 +19,8 @@ import (
 
 	"github.com/safaci2000/ghost-sso-proxy/config"
 	extauthadapter "github.com/safaci2000/ghost-sso-proxy/internal/adapters/primary/extauth"
+	authentikadapter "github.com/safaci2000/ghost-sso-proxy/internal/adapters/secondary/authentik"
 	"github.com/safaci2000/ghost-sso-proxy/internal/adapters/secondary/mariadb"
-	"github.com/safaci2000/ghost-sso-proxy/internal/adapters/secondary/oidctoken"
 	"github.com/safaci2000/ghost-sso-proxy/internal/core/service"
 )
 
@@ -69,14 +69,6 @@ func run() error {
 	logger.Info("connected to MariaDB")
 
 	// ── Secondary adapters (driven ports) ─────────────────────────────────────
-	tokenDecoder := oidctoken.NewDecoder(cfg.OIDCUserInfoURL)
-	if cfg.OIDCUserInfoURL != "" {
-		logger.Info("OIDC userinfo endpoint configured",
-			slog.String("userinfo_url", cfg.OIDCUserInfoURL))
-	} else {
-		logger.Warn("OIDC_USERINFO_URL not set — falling back to local JWT decode (local dev only)")
-	}
-
 	userRepo := mariadb.NewUserRepository(db)
 
 	sessionStore, err := mariadb.NewSessionStore(db, cfg.SessionMaxAgeDays)
@@ -86,11 +78,15 @@ func run() error {
 	logger.Info("admin_session_secret loaded for session signing",
 		slog.Int("session_max_age_days", cfg.SessionMaxAgeDays))
 
+	authentikClient := authentikadapter.NewClient(cfg.AuthentikForwardAuthURL)
+	logger.Info("authentik forward auth configured",
+		slog.String("forward_auth_url", cfg.AuthentikForwardAuthURL))
+
 	// ── Core service ──────────────────────────────────────────────────────────
-	authService := service.New(tokenDecoder, userRepo, sessionStore, logger)
+	authService := service.New(userRepo, sessionStore, logger)
 
 	// ── Primary adapter (ExtAuth gRPC server) ─────────────────────────────────
-	extauthServer := extauthadapter.NewServer(authService, logger, cfg.SessionMaxAgeDays)
+	extauthServer := extauthadapter.NewServer(authService, authentikClient, logger, cfg.SessionMaxAgeDays)
 
 	grpcServer := grpc.NewServer()
 	authv3.RegisterAuthorizationServer(grpcServer, extauthServer)
