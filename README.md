@@ -26,7 +26,7 @@ Requires [Docker](https://docs.docker.com/get-docker/) and one of:
 
 ```bash
 # Clone and open in the devcontainer
-git clone https://github.com/safaci2000/ghost-sso-proxy
+git clone https://github.com/csg33k/ghost-sso-proxy
 cd ghost-sso-proxy
 
 # VS Code: Cmd/Ctrl+Shift+P → "Dev Containers: Reopen in Container"

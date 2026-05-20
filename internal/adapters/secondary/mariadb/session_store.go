@@ -38,7 +38,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/domain"
 )
 
 // SessionStore implements driven.SessionStore against MariaDB.

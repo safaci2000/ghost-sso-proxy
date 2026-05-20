@@ -377,11 +377,11 @@ go test -race ./...
 
 # 2. Build and push
 mage buildLinux
-docker build -t ghcr.io/safaci2000/ghost-sso-proxy:main-<sha> .
-docker push ghcr.io/safaci2000/ghost-sso-proxy:main-<sha>
+docker build -t ghcr.io/csg33k/ghost-sso-proxy:main-<sha> .
+docker push ghcr.io/csg33k/ghost-sso-proxy:main-<sha>
 
 # 3. Update image tag in auth-shim.yaml
-#    image: ghcr.io/safaci2000/ghost-sso-proxy:main-<sha>
+#    image: ghcr.io/csg33k/ghost-sso-proxy:main-<sha>
 
 # 4. Commit both repos (ghost-sso-proxy + nas-flux)
 #    ArgoCD syncs automatically.

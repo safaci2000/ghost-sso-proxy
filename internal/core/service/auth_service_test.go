@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/domain"
 )
 
 // ─── Mocks ────────────────────────────────────────────────────────────────────

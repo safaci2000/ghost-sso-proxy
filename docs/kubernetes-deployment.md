@@ -87,7 +87,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: ghost-auth-shim
-          image: ghcr.io/safaci2000/ghost-sso-proxy:<tag>
+          image: ghcr.io/csg33k/ghost-sso-proxy:<tag>
           imagePullPolicy: IfNotPresent
           ports:
             - name: grpc

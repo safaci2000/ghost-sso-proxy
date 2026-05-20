@@ -3,7 +3,7 @@ package driven
 import (
 	"context"
 
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/domain"
 )
 
 // TokenDecoder extracts a verified OIDC Identity from the raw Cookie header

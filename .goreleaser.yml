@@ -58,7 +58,7 @@ checksum:
 dockers_v2:
   - id: ghost-sso-proxy
     images:
-      - "ghcr.io/safaci2000/ghost-sso-proxy"
+      - "ghcr.io/csg33k/ghost-sso-proxy"
     dockerfile: "docker/Dockerfile.release"
     platforms:
       - linux/amd64
@@ -80,7 +80,7 @@ dockers_v2:
 # ── GitHub Release ────────────────────────────────────────────────────────────
 release:
   github:
-    owner: "safaci2000"
+    owner: "csg33k"
     name: ghost-sso-proxy
   draft: false
   prerelease: auto

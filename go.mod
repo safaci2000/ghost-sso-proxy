@@ -1,4 +1,4 @@
-module github.com/safaci2000/ghost-sso-proxy
+module github.com/csg33k/ghost-sso-proxy
 
 go 1.26
 

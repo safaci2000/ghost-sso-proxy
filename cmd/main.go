@@ -17,11 +17,11 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
-	"github.com/safaci2000/ghost-sso-proxy/config"
-	extauthadapter "github.com/safaci2000/ghost-sso-proxy/internal/adapters/primary/extauth"
-	authentikadapter "github.com/safaci2000/ghost-sso-proxy/internal/adapters/secondary/authentik"
-	"github.com/safaci2000/ghost-sso-proxy/internal/adapters/secondary/mariadb"
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/service"
+	"github.com/csg33k/ghost-sso-proxy/config"
+	extauthadapter "github.com/csg33k/ghost-sso-proxy/internal/adapters/primary/extauth"
+	authentikadapter "github.com/csg33k/ghost-sso-proxy/internal/adapters/secondary/authentik"
+	"github.com/csg33k/ghost-sso-proxy/internal/adapters/secondary/mariadb"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/service"
 )
 
 func main() {

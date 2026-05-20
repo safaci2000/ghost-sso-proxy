@@ -3,7 +3,7 @@ package secondary
 import (
 	"context"
 
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/domain"
 )
 
 // SessionStore reads and writes Ghost admin sessions in the database.

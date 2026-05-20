@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/domain"
 )
 
 // UserRepository implements driven.UserRepository against the Ghost `users` table.

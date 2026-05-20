@@ -7,8 +7,8 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/domain"
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/ports/secondary"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/domain"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/ports/secondary"
 )
 
 const ghostSessionCookieName = "ghost-admin-api-session"

@@ -75,6 +75,6 @@ func ldflags() string {
 	if commit == "" {
 		commit = "unknown"
 	}
-	pkg := "github.com/safaci2000/ghost-sso-proxy/config"
+	pkg := "github.com/csg33k/ghost-sso-proxy/config"
 	return fmt.Sprintf("-s -w -X %s.GitCommit=%s", pkg, commit)
 }

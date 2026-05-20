@@ -28,11 +28,11 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	authv3 "github.com/envoyproxy/go-control-plane/envoy/service/auth/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
-	"google.golang.org/grpc/codes"
 	statuspb "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/grpc/codes"
 
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/ports/primary"
-	"github.com/safaci2000/ghost-sso-proxy/internal/core/ports/secondary"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/ports/primary"
+	"github.com/csg33k/ghost-sso-proxy/internal/core/ports/secondary"
 )
 
 const (

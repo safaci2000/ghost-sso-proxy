@@ -81,7 +81,7 @@ spec:
     spec:
       containers:
         - name: ghost-auth-shim
-          image: ghcr.io/safaci2000/ghost-sso-proxy:<tag>
+          image: ghcr.io/csg33k/ghost-sso-proxy:<tag>
           ports:
             - containerPort: 8080
               name: grpc
